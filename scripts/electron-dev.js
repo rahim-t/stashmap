@@ -10,7 +10,8 @@ const electronBinary = path.join(
   process.platform === "win32" ? "electron.cmd" : "electron"
 );
 const electronMain = path.join(__dirname, "..", "electron", "main.js");
-const devServerUrl = "http://127.0.0.1:4000";
+const devServerOrigin = "http://127.0.0.1:4000";
+const devServerUrl = process.env.ELECTRON_START_URL || devServerOrigin;
 
 function delay(ms) {
   return new Promise((resolve) => {
@@ -21,10 +22,10 @@ function delay(ms) {
 async function waitForDevServer(retries = 120) {
   const attempt = async (remaining) => {
     if (remaining <= 0) {
-      throw new Error(`Timed out waiting for ${devServerUrl}`);
+      throw new Error(`Timed out waiting for ${devServerOrigin}`);
     }
     try {
-      const response = await fetch(devServerUrl);
+      const response = await fetch(devServerOrigin);
       if (response.ok) {
         return;
       }

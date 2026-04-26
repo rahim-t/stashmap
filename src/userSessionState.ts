@@ -92,8 +92,14 @@ function saveViewsToStorage(publicKey: PublicKey, views: Views): void {
   }
 }
 
+export function routePathFromLocation(location: Location): string {
+  const hashRoute = location.hash.match(/^#(\/(?:n|r)\/.*)$/);
+  return hashRoute ? hashRoute[1] : location.pathname;
+}
+
 function getInitialPanes(publicKey: PublicKey): Pane[] {
-  const nodeID = parseNodeRouteUrl(window.location.pathname);
+  const routePath = routePathFromLocation(window.location);
+  const nodeID = parseNodeRouteUrl(routePath);
   if (nodeID) {
     const nodeAuthor = splitID(nodeID)[0] || publicKey;
     return [
@@ -105,7 +111,7 @@ function getInitialPanes(publicKey: PublicKey): Pane[] {
       },
     ];
   }
-  const urlStack = pathToStack(window.location.pathname);
+  const urlStack = pathToStack(routePath);
   if (urlStack.length > 0) {
     const urlAuthor =
       parseAuthorFromSearch(window.location.search) || publicKey;

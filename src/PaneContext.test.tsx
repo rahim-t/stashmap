@@ -12,7 +12,14 @@ import {
   openReadonlyRoute,
 } from "./utils.test";
 import { UNAUTHENTICATED_USER_PK } from "./NostrAuthContext";
-import { defaultPane } from "./userSessionState";
+import { defaultPane, routePathFromLocation } from "./userSessionState";
+
+test("Desktop hash route is used as initial node path", () => {
+  const location = new URL("http://127.0.0.1:4000/#/n/scholarium%20eBibliothek");
+  expect(routePathFromLocation(location as unknown as Location)).toBe(
+    "/n/scholarium%20eBibliothek"
+  );
+});
 
 test("App defaults to empty pane with new node editor when visiting /", async () => {
   const [alice] = setup([ALICE]);
