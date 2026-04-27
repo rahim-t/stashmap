@@ -31,6 +31,7 @@ export type TreeResult = {
   paths: List<ViewPath>;
   virtualRows: VirtualRowsMap;
   firstVirtualKeys: ImmutableSet<string>;
+  displayDepths: Map<string, number>;
 };
 
 type TreeTraversalOptions = {
@@ -39,6 +40,33 @@ type TreeTraversalOptions = {
 
 const EMPTY_VIRTUAL_ROWS: VirtualRowsMap = Map<string, GraphNode>();
 const EMPTY_FIRST_VIRTUAL_KEYS: ImmutableSet<string> = ImmutableSet<string>();
+const EMPTY_DISPLAY_DEPTHS: Map<string, number> = Map<string, number>();
+
+function emptyTreeResult(): TreeResult {
+  return {
+    paths: List<ViewPath>(),
+    virtualRows: EMPTY_VIRTUAL_ROWS,
+    firstVirtualKeys: EMPTY_FIRST_VIRTUAL_KEYS,
+    displayDepths: EMPTY_DISPLAY_DEPTHS,
+  };
+}
+
+function isNodeKindFilterActive(
+  nodeKindFilters: Pane["nodeKindFilters"]
+): nodeKindFilters is NodeKind[] {
+  return nodeKindFilters !== undefined;
+}
+
+function nodeMatchesKindFilters(
+  node: GraphNode,
+  nodeKindFilters: NodeKind[]
+): boolean {
+  return !!node.nodeKind && nodeKindFilters.includes(node.nodeKind);
+}
+
+function isNodeKindIndexMode(nodeKindFilters: NodeKind[]): boolean {
+  return !nodeKindFilters.includes("topic");
+}
 
 function getChildrenForConcreteRef(
   data: Data,
@@ -52,11 +80,7 @@ function getChildrenForConcreteRef(
       ? resolveNode(data.knowledgeDBs, refNode)
       : getNode(data.knowledgeDBs, parentRowID, data.user.publicKey);
   if (!sourceNode || sourceNode.children.size === 0) {
-    return {
-      paths: List(),
-      virtualRows: EMPTY_VIRTUAL_ROWS,
-      firstVirtualKeys: EMPTY_FIRST_VIRTUAL_KEYS,
-    };
+    return emptyTreeResult();
   }
 
   return {
@@ -65,7 +89,202 @@ function getChildrenForConcreteRef(
       .toList(),
     virtualRows: EMPTY_VIRTUAL_ROWS,
     firstVirtualKeys: EMPTY_FIRST_VIRTUAL_KEYS,
+    displayDepths: EMPTY_DISPLAY_DEPTHS,
   };
+}
+
+function getSemanticNodeChildren(
+  data: Data,
+  parentPath: ViewPath,
+  nodes: GraphNode,
+  activeFilters: NonNullable<Pane["typeFilters"]>,
+  nodeKindFilters: NodeKind[]
+): List<ViewPath> {
+  const descendantMemo = new globalThis.Map<string, boolean>();
+  const visiting = new globalThis.Set<string>();
+
+  type SemanticEntry = {
+    childPath: ViewPath;
+    childNode: GraphNode;
+    ancestors: GraphNode[];
+    orderKey: string;
+  };
+
+  const orderKeyForChild = (parentOrderKey: string, index: number): string =>
+    `${parentOrderKey}/${String(index).padStart(6, "0")}`;
+
+  const getFilteredChildEntries = (parent: GraphNode): SemanticEntry[] =>
+    parent.children
+      .map((childID, index) => ({
+        childID,
+        childNode:
+          childID === EMPTY_SEMANTIC_ID
+            ? undefined
+            : getNode(data.knowledgeDBs, childID, data.user.publicKey),
+        index,
+      }))
+      .filter(
+        (
+          entry
+        ): entry is {
+          childID: ID;
+          childNode: GraphNode;
+          index: number;
+        } =>
+          !!entry.childNode && itemPassesFilters(entry.childNode, activeFilters)
+      )
+      .map(({ childNode, index }) => ({
+        childNode,
+        childPath: addNodeToPathWithNodes(parentPath, parent, index),
+        ancestors: [parent],
+        orderKey: orderKeyForChild("", index),
+      }))
+      .toArray();
+
+  const getEntriesForPath = (
+    path: ViewPath,
+    parent: GraphNode,
+    ancestors: GraphNode[] = [],
+    parentOrderKey = ""
+  ): SemanticEntry[] =>
+    parent.children
+      .map((childID, index) => ({
+        childID,
+        childNode:
+          childID === EMPTY_SEMANTIC_ID
+            ? undefined
+            : getNode(data.knowledgeDBs, childID, data.user.publicKey),
+        index,
+      }))
+      .filter(
+        (
+          entry
+        ): entry is {
+          childID: ID;
+          childNode: GraphNode;
+          index: number;
+        } =>
+          !!entry.childNode && itemPassesFilters(entry.childNode, activeFilters)
+      )
+      .map(({ childNode, index }) => ({
+        childNode,
+        childPath: addNodeToPathWithNodes(path, parent, index),
+        ancestors: [...ancestors, parent],
+        orderKey: orderKeyForChild(parentOrderKey, index),
+      }))
+      .toArray();
+
+  const hasMatchingDescendant = (path: ViewPath, node: GraphNode): boolean => {
+    const key = viewPathToString(path);
+    const cached = descendantMemo.get(key);
+    if (cached !== undefined) {
+      return cached;
+    }
+    if (visiting.has(key)) {
+      return false;
+    }
+    visiting.add(key);
+    const found = getEntriesForPath(path, node).some(
+      ({ childPath, childNode }) =>
+        nodeMatchesKindFilters(childNode, nodeKindFilters) ||
+        hasMatchingDescendant(childPath, childNode)
+    );
+    visiting.delete(key);
+    descendantMemo.set(key, found);
+    return found;
+  };
+
+  const collectFromNode = (path: ViewPath, node: GraphNode): ViewPath[] =>
+    getEntriesForPath(path, node).flatMap(({ childPath, childNode }) => {
+      if (nodeMatchesKindFilters(childNode, nodeKindFilters)) {
+        return [childPath];
+      }
+      return collectFromNode(childPath, childNode);
+    });
+
+  const collectIndexEntries = (
+    path: ViewPath,
+    node: GraphNode,
+    ancestors: GraphNode[],
+    parentOrderKey = ""
+  ): SemanticEntry[] =>
+    getEntriesForPath(path, node, ancestors, parentOrderKey).flatMap(
+      (entry) => {
+        const descendants = collectIndexEntries(
+          entry.childPath,
+          entry.childNode,
+          entry.ancestors,
+          entry.orderKey
+        );
+        return nodeMatchesKindFilters(entry.childNode, nodeKindFilters)
+          ? [entry, ...descendants]
+          : descendants;
+      }
+    );
+
+  const nearestAncestorText = (
+    ancestors: GraphNode[],
+    kind: NodeKind
+  ): string =>
+    ancestors
+      .slice()
+      .reverse()
+      .find((ancestor) => ancestor.nodeKind === kind)
+      ?.text.toLocaleLowerCase() || "";
+
+  const kindRank = (node: GraphNode): number => {
+    if (node.nodeKind === "author") return 0;
+    if (node.nodeKind === "source") return 1;
+    if (node.nodeKind === "statement") return 2;
+    if (node.nodeKind === "task") return 3;
+    return 4;
+  };
+
+  const indexSortKey = (entry: SemanticEntry): string => {
+    const nodeText = entry.childNode.text.toLocaleLowerCase();
+    const authorText = nearestAncestorText(entry.ancestors, "author");
+    const sourceText = nearestAncestorText(entry.ancestors, "source");
+    if (entry.childNode.nodeKind === "author") {
+      return `${kindRank(entry.childNode)}\u0000${nodeText}`;
+    }
+    if (entry.childNode.nodeKind === "source") {
+      return `${kindRank(entry.childNode)}\u0000${authorText}\u0000${nodeText}`;
+    }
+    if (entry.childNode.nodeKind === "statement") {
+      return `${kindRank(
+        entry.childNode
+      )}\u0000${authorText}\u0000${sourceText}\u0000${String(entry.orderKey)}`;
+    }
+    return `${kindRank(entry.childNode)}\u0000${entry.orderKey}`;
+  };
+
+  const compareIndexEntries = (
+    left: SemanticEntry,
+    right: SemanticEntry
+  ): number => {
+    const keyCompare = indexSortKey(left).localeCompare(indexSortKey(right));
+    return keyCompare === 0
+      ? left.orderKey.localeCompare(right.orderKey)
+      : keyCompare;
+  };
+
+  if (isNodeKindIndexMode(nodeKindFilters)) {
+    const entries = collectIndexEntries(parentPath, nodes, []);
+    return List(
+      [...entries].sort(compareIndexEntries).map((entry) => entry.childPath)
+    );
+  }
+
+  return List(
+    getFilteredChildEntries(nodes).flatMap(({ childPath, childNode }) => {
+      if (nodeMatchesKindFilters(childNode, nodeKindFilters)) {
+        return [childPath];
+      }
+      return hasMatchingDescendant(childPath, childNode)
+        ? collectFromNode(childPath, childNode)
+        : [];
+    })
+  );
 }
 
 function getChildrenForRegularNode(
@@ -76,6 +295,7 @@ function getChildrenForRegularNode(
   rootNode: LongID | undefined,
   author: PublicKey,
   typeFilters: Pane["typeFilters"],
+  nodeKindFilters: Pane["nodeKindFilters"],
   options?: TreeTraversalOptions
 ): TreeResult {
   const effectiveAuthor = getEffectiveAuthor(data, parentPath);
@@ -92,31 +312,44 @@ function getChildrenForRegularNode(
     : parentRowID;
   const coordinateSemanticID = nodes ? nodeSemanticID : parentRowID;
 
-  const nodePaths = nodes
-    ? nodes.children
-        .map((childID, index) => ({
-          childID,
-          childNode:
-            childID === EMPTY_SEMANTIC_ID
-              ? undefined
-              : getNode(data.knowledgeDBs, childID, data.user.publicKey),
-          index,
-        }))
-        .filter(({ childID, childNode }) =>
-          options?.isMarkdownExport
-            ? !!childNode
-            : childID === EMPTY_SEMANTIC_ID ||
-              (!!childNode && itemPassesFilters(childNode, activeFilters))
-        )
-        .map(({ index }) => addNodeToPathWithNodes(parentPath, nodes, index))
-        .toList()
-    : List<ViewPath>();
+  const nodePaths = (() => {
+    if (!nodes) {
+      return List<ViewPath>();
+    }
+    if (isNodeKindFilterActive(nodeKindFilters) && !options?.isMarkdownExport) {
+      return getSemanticNodeChildren(
+        data,
+        parentPath,
+        nodes,
+        activeFilters,
+        nodeKindFilters
+      );
+    }
+    return nodes.children
+      .map((childID, index) => ({
+        childID,
+        childNode:
+          childID === EMPTY_SEMANTIC_ID
+            ? undefined
+            : getNode(data.knowledgeDBs, childID, data.user.publicKey),
+        index,
+      }))
+      .filter(({ childID, childNode }) =>
+        options?.isMarkdownExport
+          ? !!childNode
+          : childID === EMPTY_SEMANTIC_ID ||
+            (!!childNode && itemPassesFilters(childNode, activeFilters))
+      )
+      .map(({ index }) => addNodeToPathWithNodes(parentPath, nodes, index))
+      .toList();
+  })();
 
-  if (options?.isMarkdownExport) {
+  if (options?.isMarkdownExport || isNodeKindFilterActive(nodeKindFilters)) {
     return {
       paths: nodePaths,
       virtualRows: EMPTY_VIRTUAL_ROWS,
       firstVirtualKeys: EMPTY_FIRST_VIRTUAL_KEYS,
+      displayDepths: EMPTY_DISPLAY_DEPTHS,
     };
   }
 
@@ -232,6 +465,7 @@ function getChildrenForRegularNode(
     paths: nodePaths.concat(withVersions.paths),
     virtualRows: withVersions.virtualRows,
     firstVirtualKeys,
+    displayDepths: EMPTY_DISPLAY_DEPTHS,
   };
 }
 
@@ -242,6 +476,7 @@ export function getTreeChildren(
   rootNode: LongID | undefined,
   author: PublicKey,
   typeFilters: Pane["typeFilters"],
+  nodeKindFilters: Pane["nodeKindFilters"],
   options?: TreeTraversalOptions,
   virtualRows: VirtualRowsMap = EMPTY_VIRTUAL_ROWS
 ): TreeResult {
@@ -267,6 +502,7 @@ export function getTreeChildren(
     rootNode,
     author,
     typeFilters,
+    nodeKindFilters,
     options
   );
 }
@@ -279,8 +515,10 @@ export function getNodesInTree(
   rootNode: LongID | undefined,
   author: PublicKey,
   typeFilters: Pane["typeFilters"],
+  nodeKindFilters: Pane["nodeKindFilters"],
   options?: TreeTraversalOptions,
-  virtualRows: VirtualRowsMap = EMPTY_VIRTUAL_ROWS
+  virtualRows: VirtualRowsMap = EMPTY_VIRTUAL_ROWS,
+  displayDepths: Map<string, number> = EMPTY_DISPLAY_DEPTHS
 ): TreeResult {
   const childResult = getTreeChildren(
     data,
@@ -289,6 +527,7 @@ export function getNodesInTree(
     rootNode,
     author,
     typeFilters,
+    nodeKindFilters,
     options,
     virtualRows
   );
@@ -297,13 +536,29 @@ export function getNodesInTree(
     (result, childPath) => {
       const [, childView] = getRowIDFromView(data, childPath);
       const withChild = result.paths.push(childPath);
+      const nodeKindFilterActive = isNodeKindFilterActive(nodeKindFilters);
+      const parentDepth =
+        result.displayDepths.get(viewPathToString(parentPath)) ??
+        parentPath.length - 1;
+      const childKey = viewPathToString(childPath);
+      const childDisplayDepth = nodeKindFilterActive
+        ? parentDepth + 1
+        : childPath.length - 1;
+      const withDisplayDepths = result.displayDepths.set(
+        childKey,
+        childDisplayDepth
+      );
 
       const childEdge =
         result.virtualRows.get(viewPathToString(childPath)) ||
         getCurrentEdgeForView(data, childPath);
+      const shouldRenderAsIndex =
+        nodeKindFilterActive &&
+        nodeKindFilters !== undefined &&
+        isNodeKindIndexMode(nodeKindFilters);
       const shouldRecurse = options?.isMarkdownExport
         ? !isRefNode(childEdge)
-        : childView.expanded;
+        : !shouldRenderAsIndex && childView.expanded;
       if (shouldRecurse) {
         const sub = getNodesInTree(
           data,
@@ -313,21 +568,25 @@ export function getNodesInTree(
           rootNode,
           author,
           typeFilters,
+          nodeKindFilters,
           options,
-          result.virtualRows
+          result.virtualRows,
+          withDisplayDepths
         );
         return {
           paths: sub.paths,
           virtualRows: result.virtualRows.merge(sub.virtualRows),
           firstVirtualKeys: result.firstVirtualKeys.union(sub.firstVirtualKeys),
+          displayDepths: sub.displayDepths,
         };
       }
-      return { ...result, paths: withChild };
+      return { ...result, paths: withChild, displayDepths: withDisplayDepths };
     },
     {
       paths: ctx,
       virtualRows: childResult.virtualRows,
       firstVirtualKeys: childResult.firstVirtualKeys,
+      displayDepths,
     }
   );
 }

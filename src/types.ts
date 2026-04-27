@@ -148,6 +148,7 @@ declare global {
       | "incoming"
       | "contains"
     )[];
+    nodeKindFilters?: NodeKind[];
     scrollToId?: string;
   };
 
