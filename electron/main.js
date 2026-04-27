@@ -328,7 +328,7 @@ function createWindow() {
   });
 
   loadTarget.then(() => {
-    if (isDev) {
+    if (isDev && process.env.KNOWSTR_OPEN_DEVTOOLS === "1") {
       window.webContents.openDevTools({ mode: "detach" });
     }
   });
