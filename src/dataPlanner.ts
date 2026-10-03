@@ -1,11 +1,6 @@
 import { Set } from "immutable";
-import {
-  deleteNodes,
-  getNodeContext,
-  getNode,
-  isRefNode,
-  shortID,
-} from "./connections";
+import { getWorkspaceNode } from "./core/knowledge";
+import { deleteNodes } from "./core/connections";
 import {
   GraphPlan,
   planDeleteDescendantNodes,
@@ -15,15 +10,8 @@ import {
 } from "./planner";
 import { NodeItemMetadata, updateNodeItemMetadata } from "./nodeItemMetadata";
 
-function getWritableNode(
-  plan: GraphPlan,
-  nodeId: LongID
-): GraphNode | undefined {
-  const node = getNode(plan.knowledgeDBs, nodeId, plan.user.publicKey);
-  if (!node || node.author !== plan.user.publicKey) {
-    return undefined;
-  }
-  return node;
+function getWritableNode(plan: GraphPlan, nodeId: ID): GraphNode | undefined {
+  return getWorkspaceNode(plan.knowledgeDBs, nodeId);
 }
 
 function getNodeItemIndex(node: GraphNode, itemId: ID): number | undefined {
@@ -38,14 +26,12 @@ function requireNodeItem(
 ): GraphNode | undefined {
   const index = getNodeItemIndex(node, itemId);
   const childID = index === undefined ? undefined : node.children.get(index);
-  return childID
-    ? getNode(plan.knowledgeDBs, childID, plan.user.publicKey)
-    : undefined;
+  return childID ? getWorkspaceNode(plan.knowledgeDBs, childID) : undefined;
 }
 
 export function planUpdateNodeItemMetadataById<T extends GraphPlan>(
   plan: T,
-  parentNodeId: LongID,
+  parentNodeId: ID,
   itemId: ID,
   metadata: NodeItemMetadata
 ): T {
@@ -65,7 +51,7 @@ export function planUpdateNodeItemMetadataById<T extends GraphPlan>(
 
 export function planRemoveNodeItemById<T extends GraphPlan>(
   plan: T,
-  parentNodeId: LongID,
+  parentNodeId: ID,
   itemId: ID,
   preserveDescendants = false
 ): T {
@@ -82,14 +68,10 @@ export function planRemoveNodeItemById<T extends GraphPlan>(
     plan,
     deleteNodes(parentNode, Set([nodeIndex]))
   );
-  if (!item || isRefNode(item)) {
+  if (!item) {
     return withoutItem;
   }
-  const sourceNode = getNode(
-    withoutItem.knowledgeDBs,
-    item.id,
-    withoutItem.user.publicKey
-  );
+  const sourceNode = getWorkspaceNode(withoutItem.knowledgeDBs, item.id);
   if (!sourceNode) {
     return withoutItem;
   }
@@ -97,10 +79,8 @@ export function planRemoveNodeItemById<T extends GraphPlan>(
     return planMoveDescendantNodes(
       withoutItem,
       sourceNode,
-      getNodeContext(withoutItem.knowledgeDBs, sourceNode),
       undefined,
-      undefined,
-      shortID(sourceNode.id)
+      sourceNode.id
     );
   }
   return planDeleteNodes(

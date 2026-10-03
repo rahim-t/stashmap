@@ -11,7 +11,14 @@ import {
   matchFilters,
 } from "nostr-tools";
 import { v4 } from "uuid";
-import { KIND_KNOWLEDGE_DOCUMENT_SNAPSHOT } from "./nostr";
+import { KIND_KNOWLEDGE_DOCUMENT } from "./nostr";
+import { decryptStorageEvent } from "./storageEncryption";
+
+// eslint-disable-next-line functional/no-let
+let storageDecryptUsers: ReadonlyArray<User> = [];
+export function registerStorageDecryptUsers(users: ReadonlyArray<User>): void {
+  storageDecryptUsers = users;
+}
 
 type SubscriptionRecord = {
   filters: Filter[];
@@ -25,6 +32,7 @@ type QueryRecord = {
 
 export type MockRelayPool = SimplePool & {
   getEvents: () => Array<Event & { relays?: string[] }>;
+  getDecryptedEvents: () => Array<Event & EventAttachment>;
   getPublishedOnRelays: () => Array<string>;
   resetPublishedOnRelays: () => void;
   getSubscriptions: () => Array<SubscriptionRecord>;
@@ -90,6 +98,18 @@ export function mockRelayPool(): MockRelayPool {
   // eslint-disable-next-line functional/no-let
   let queryRecords = Map<string, QueryRecord>();
   const events: Array<Event & { relays?: string[] }> = [];
+  const decryptedEvents: Array<Event & EventAttachment> = [];
+
+  const addToDecryptedShadow = async (event: Event): Promise<void> => {
+    const author = storageDecryptUsers.find(
+      (user) => user.publicKey === event.pubkey
+    );
+    const opened = await decryptStorageEvent(event, author, []);
+    if (opened) {
+      // eslint-disable-next-line functional/immutable-data
+      decryptedEvents.push(opened as Event & EventAttachment);
+    }
+  };
 
   return {
     subscribeMany: (
@@ -126,9 +146,11 @@ export function mockRelayPool(): MockRelayPool {
       events.push({ ...event, relays });
       publishedOnRelays = Set([...publishedOnRelays, ...relays]).toArray();
       act(() => broadcastEvent(subs, event));
-      return relays.map(() => Promise.resolve(""));
+      const shadowed = addToDecryptedShadow(event);
+      return relays.map(() => shadowed.then(() => ""));
     },
     getEvents: () => events,
+    getDecryptedEvents: () => decryptedEvents,
     getPublishedOnRelays: () => publishedOnRelays,
     resetPublishedOnRelays: () => {
       publishedOnRelays = [];
@@ -148,7 +170,7 @@ test("replay honors limit 0 but still delivers future matching events", () => {
     id: "old-event".padEnd(64, "0"),
     pubkey: "alice" as PublicKey,
     created_at: 10,
-    kind: KIND_KNOWLEDGE_DOCUMENT_SNAPSHOT,
+    kind: KIND_KNOWLEDGE_DOCUMENT,
     sig: "0".repeat(128),
     tags: [["d", "root-1"]],
     content: "# Old Root",
@@ -161,7 +183,7 @@ test("replay honors limit 0 but still delivers future matching events", () => {
     [
       {
         authors: ["alice"],
-        kinds: [KIND_KNOWLEDGE_DOCUMENT_SNAPSHOT],
+        kinds: [KIND_KNOWLEDGE_DOCUMENT],
         limit: 0,
       },
     ],
@@ -193,7 +215,7 @@ test("replay honors since, until, and limit semantics", () => {
         id: `event-${createdAt}`.padEnd(64, `${createdAt % 10}`),
         pubkey: "alice" as PublicKey,
         created_at: createdAt,
-        kind: KIND_KNOWLEDGE_DOCUMENT_SNAPSHOT,
+        kind: KIND_KNOWLEDGE_DOCUMENT,
         sig: "0".repeat(128),
         tags: [["d", `root-${createdAt}`]],
         content: `# Root ${createdAt}`,
@@ -209,7 +231,7 @@ test("replay honors since, until, and limit semantics", () => {
     [
       {
         authors: ["alice"],
-        kinds: [KIND_KNOWLEDGE_DOCUMENT_SNAPSHOT],
+        kinds: [KIND_KNOWLEDGE_DOCUMENT],
         since: 9,
         until: 20,
         limit: 2,

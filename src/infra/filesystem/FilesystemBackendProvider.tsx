@@ -1,22 +1,34 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
+import { AbstractSimplePool, verifyEvent } from "nostr-tools";
+import { Map as ImmutableMap } from "immutable";
+import { hexToBytes } from "@noble/hashes/utils";
 import { Backend, BackendProvider, WorkspaceState } from "../../BackendContext";
 import { LoadedCliProfile } from "../../cli/config";
-import type { Document } from "../../DocumentStore";
-import type { FsEventHandler } from "../../core/workspaceWatcher";
+import type {
+  WorkspaceMarkdownFile,
+  WorkspaceWriteRequest,
+} from "./workspaceBackend";
+import type { FsEventHandler } from "./workspaceWatcher";
+import type { WritePublisher } from "./writeSupport";
+import type { WorkspaceConfig } from "../../workspaceConfig";
+import { publishEventToRelays } from "../nostr/nostrPublish";
 
 export type WorkspaceLoaded = {
   profile: LoadedCliProfile;
-  documents: Document[];
+  files: WorkspaceMarkdownFile[];
+  // Hex private key from the profile's nsec file, when present. Publishing
+  // signs deposits in the renderer; local work needs no key.
+  privateKey?: string;
 };
 
 export type WorkspaceIpc = {
   load: () => Promise<WorkspaceLoaded | null>;
   pickFolder: () => Promise<string | null>;
   open: (folder: string) => Promise<void>;
-  create: (args: { folder: string; secretKeyInput?: string }) => Promise<void>;
-  isInitialised: (folder: string) => Promise<boolean>;
+  create: (args: { folder: string }) => Promise<void>;
+  configure: (config: WorkspaceConfig) => Promise<void>;
   save: (
-    documents: ReadonlyArray<Document>,
+    writes: ReadonlyArray<WorkspaceWriteRequest>,
     deletedPaths?: ReadonlyArray<string>
   ) => Promise<{ changed_paths: string[]; removed_paths: string[] }>;
   subscribeFsEvents: (handler: FsEventHandler) => () => void;
@@ -26,11 +38,29 @@ type LoadState =
   | { status: "loading" }
   | { status: "loaded"; data: WorkspaceLoaded | null };
 
+export type RelayPoolLike = {
+  subscribe: Backend["subscribe"];
+  publish: Backend["publish"];
+};
+
+function realRelayPool(): RelayPoolLike {
+  const pool = new AbstractSimplePool({ verifyEvent });
+  return {
+    subscribe: (relayList, filters, params) =>
+      pool.subscribeMany(relayList, filters, params),
+    publish: (relayList, event) => pool.publish(relayList, event),
+  };
+}
+
 export function FilesystemBackendProvider({
   ipc,
+  pool,
+  publisher,
   children,
 }: {
   ipc: WorkspaceIpc;
+  pool?: RelayPoolLike;
+  publisher?: WritePublisher;
   children: React.ReactNode;
 }): JSX.Element | null {
   const [state, setState] = useState<LoadState>({ status: "loading" });
@@ -51,17 +81,54 @@ export function FilesystemBackendProvider({
     setVersion((v) => v + 1);
   }, []);
 
+  const relayPool = useMemo(() => pool ?? realRelayPool(), [pool]);
+  const writePublisher = useMemo<WritePublisher>(
+    () =>
+      publisher ?? {
+        publishEvent: async (relayUrls, event) => {
+          try {
+            return await publishEventToRelays(
+              { publish: relayPool.publish },
+              event,
+              relayUrls
+            );
+          } catch (error) {
+            return {
+              event,
+              results: ImmutableMap(
+                relayUrls.map((url) => [
+                  url,
+                  { status: "rejected", reason: String(error) },
+                ])
+              ),
+            };
+          }
+        },
+      },
+    [publisher, relayPool]
+  );
+
   const backend: Backend = useMemo(() => {
     const data = state.status === "loaded" ? state.data : null;
     const profile = data?.profile ?? null;
-    const documents = data?.documents ?? [];
-    const user = profile ? { publicKey: profile.pubkey } : undefined;
-    const defaultRelays = profile?.relays ?? [];
+    const files = data?.files ?? [];
+    const user = profile?.pubkey
+      ? {
+          publicKey: profile.pubkey,
+          ...(data?.privateKey
+            ? { privateKey: hexToBytes(data.privateKey) }
+            : {}),
+        }
+      : undefined;
+    const workspaceConfig = profile?.workspaceConfig ?? {
+      storageRelays: [],
+      roomRelays: [],
+    };
     const workspace: WorkspaceState = {
       profile,
-      documents,
+      files,
       pickFolder: () => ipc.pickFolder(),
-      isInitialised: (folder) => ipc.isInitialised(folder),
+      publisher: writePublisher,
       open: async (folder) => {
         await ipc.open(folder);
         refresh();
@@ -70,28 +137,21 @@ export function FilesystemBackendProvider({
         await ipc.create(args);
         refresh();
       },
-      save: (documentsToWrite, deletedPaths) =>
-        ipc.save(documentsToWrite, deletedPaths),
+      configure: async (config) => {
+        await ipc.configure(config);
+        refresh();
+      },
+      save: (writes, deletedPaths) => ipc.save(writes, deletedPaths),
       subscribeFsEvents: (handler) => ipc.subscribeFsEvents(handler),
     };
     return {
-      subscribe: (_relays, _filters, params) => {
-        params.oneose?.();
-        return { close: () => undefined };
-      },
-      publish: (relayList, event) => {
-        // eslint-disable-next-line no-console
-        console.warn(
-          "Filesystem publish not yet implemented; dropping event",
-          event.kind
-        );
-        return relayList.map(() => Promise.resolve(""));
-      },
+      subscribe: relayPool.subscribe,
+      publish: relayPool.publish,
       user,
-      defaultRelays,
+      workspaceConfig,
       workspace,
     };
-  }, [state, ipc, refresh]);
+  }, [state, ipc, refresh, relayPool, writePublisher]);
 
   if (state.status === "loading") {
     return null;

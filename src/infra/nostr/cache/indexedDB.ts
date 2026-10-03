@@ -2,13 +2,12 @@
 import { Event, UnsignedEvent } from "nostr-tools";
 
 const DB_NAME = "stashmap";
-const DB_VERSION = 4;
+const DB_VERSION = 5;
 const OUTBOX_STORE = "outbox";
 const EVENT_CACHE_STORE = "eventCache";
 const DOCUMENT_STORE = "documents";
 const DOCUMENT_DELETE_STORE = "documentDeletes";
 const SYNC_CHECKPOINT_STORE = "syncCheckpoints";
-const SNAPSHOT_STORE = "snapshots";
 const OPEN_DATABASES = new Set<StashmapDB>();
 const DOCUMENT_STORE_LISTENERS = new WeakMap<
   StashmapDB,
@@ -32,6 +31,7 @@ export type StoredDocumentRecord = {
   readonly content: string;
   readonly tags: string[][];
   readonly filePath?: string;
+  readonly storageKey?: string;
 };
 
 export type StoredDeleteRecord = {
@@ -40,11 +40,6 @@ export type StoredDeleteRecord = {
   readonly eventId: string;
   readonly createdAt: number;
   readonly deletedAt: number;
-};
-
-export type StoredSnapshotRecord = StoredDocumentRecord & {
-  readonly sourceRootShortID?: string;
-  readonly sourceAuthor: PublicKey;
 };
 
 export type SyncCheckpointRecord = {
@@ -132,15 +127,13 @@ export const openDB = (): Promise<StashmapDB | null> => {
           keyPath: "author",
         });
       }
-      if (!db.objectStoreNames.contains(SNAPSHOT_STORE)) {
-        db.createObjectStore(SNAPSHOT_STORE, {
-          keyPath: "replaceableKey",
-        });
-      }
       if (oldVersion < 3) {
         request.transaction?.objectStore(DOCUMENT_STORE).clear();
         request.transaction?.objectStore(DOCUMENT_DELETE_STORE).clear();
         request.transaction?.objectStore(SYNC_CHECKPOINT_STORE).clear();
+      }
+      if (oldVersion < 5) {
+        request.transaction?.objectStore(OUTBOX_STORE).clear();
       }
     };
     request.onsuccess = () => {
@@ -165,12 +158,59 @@ const txStore = (
   mode: IDBTransactionMode
 ): IDBObjectStore => db.transaction(store, mode).objectStore(store);
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return (
+    Array.isArray(value) && value.every((entry) => typeof entry === "string")
+  );
+}
+
+function isPublicationRoute(value: unknown): value is PublicationRoute {
+  if (!isRecord(value) || typeof value.kind !== "string") return false;
+  if (value.kind === "storage" || value.kind === "shared") return true;
+  return value.kind === "configuration" && isStringArray(value.relays);
+}
+
+function isOutboxEntry(value: unknown): value is OutboxEntry {
+  if (
+    !isRecord(value) ||
+    typeof value.key !== "string" ||
+    typeof value.createdAt !== "number" ||
+    !isRecord(value.event)
+  ) {
+    return false;
+  }
+  const { event } = value;
+  return (
+    typeof event.kind === "number" &&
+    typeof event.pubkey === "string" &&
+    typeof event.created_at === "number" &&
+    typeof event.content === "string" &&
+    Array.isArray(event.tags) &&
+    event.tags.every(isStringArray) &&
+    isPublicationRoute(event.route) &&
+    (event.storageKey === undefined || typeof event.storageKey === "string") &&
+    (value.succeededRelays === undefined ||
+      isStringArray(value.succeededRelays))
+  );
+}
+
 export const getOutboxEvents = (
   db: StashmapDB
 ): Promise<ReadonlyArray<OutboxEntry>> =>
   new Promise((resolve, reject) => {
     const request = txStore(db, OUTBOX_STORE, "readonly").getAll();
-    request.onsuccess = () => resolve(request.result);
+    request.onsuccess = () => {
+      const { result }: { result: unknown } = request;
+      if (!Array.isArray(result)) {
+        reject(new Error("Invalid outbox store"));
+        return;
+      }
+      resolve(result.filter(isOutboxEntry));
+    };
     request.onerror = () => reject(request.error);
   });
 
@@ -348,27 +388,6 @@ export const putSyncCheckpoint = (
     const request = txStore(db, SYNC_CHECKPOINT_STORE, "readwrite").put(
       checkpoint
     );
-    request.onsuccess = () => resolve();
-    request.onerror = () => reject(request.error);
-  });
-
-export const getStoredSnapshot = (
-  db: StashmapDB,
-  replaceableKey: string
-): Promise<StoredSnapshotRecord | undefined> =>
-  new Promise((resolve, reject) => {
-    const request = txStore(db, SNAPSHOT_STORE, "readonly").get(replaceableKey);
-    request.onsuccess = () =>
-      resolve(request.result as StoredSnapshotRecord | undefined);
-    request.onerror = () => reject(request.error);
-  });
-
-export const putStoredSnapshot = (
-  db: StashmapDB,
-  snapshot: StoredSnapshotRecord
-): Promise<void> =>
-  new Promise((resolve, reject) => {
-    const request = txStore(db, SNAPSHOT_STORE, "readwrite").put(snapshot);
     request.onsuccess = () => resolve();
     request.onerror = () => reject(request.error);
   });

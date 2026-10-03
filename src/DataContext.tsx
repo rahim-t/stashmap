@@ -1,25 +1,38 @@
-import React from "react";
+import React, { useEffect } from "react";
 import { Map } from "immutable";
-import { newDB } from "./knowledge";
-import { injectEmptyNodesIntoKnowledgeDBs } from "./connections";
+import { LOCAL } from "./core/nodeRef";
+import { newDB } from "./core/knowledge";
+import { injectEmptyNodesIntoKnowledgeDBs } from "./core/connections";
 import {
   useDocumentKnowledgeDBs,
-  useDocumentSemanticIndex,
-  useDocumentSnapshotNodes,
+  useDocumentGraphIndex,
+  useDocuments,
+  useDocumentByFilePath,
 } from "./DocumentStore";
+import { mergeGraphIndexes } from "./graphIndex";
+import { loadedFeedUrls } from "./core/ical";
+import { useCalendarFeeds } from "./CalendarFeedContext";
+import type { Document as KnowstrDocument } from "./core/Document";
 
-export type DataContextProps = Data;
+export type DataContextProps = Omit<Data, "computedNodes">;
 
-const DataContext = React.createContext<DataContextProps | undefined>(
-  undefined
-);
+const DataContext = React.createContext<Data | undefined>(undefined);
 
-export function useData(): DataContextProps {
+export function useData(): Data {
   const context = React.useContext(DataContext);
   if (context === undefined) {
     throw new Error("DataContext not provided");
   }
   return context;
+}
+
+function CalendarFeedDiscovery(): null {
+  const { knowledgeDBs, graphIndex } = useData();
+  const { requestFeed } = useCalendarFeeds();
+  useEffect(() => {
+    loadedFeedUrls({ knowledgeDBs, graphIndex }).forEach(requestFeed);
+  }, [knowledgeDBs, graphIndex, requestFeed]);
+  return null;
 }
 
 export function DataContextProvider({
@@ -28,7 +41,13 @@ export function DataContextProvider({
 }: DataContextProps & {
   children: React.ReactNode;
 }): JSX.Element {
-  return <DataContext.Provider value={props}>{children}</DataContext.Provider>;
+  const { computedNodes } = useCalendarFeeds();
+  return (
+    <DataContext.Provider value={{ ...props, computedNodes }}>
+      <CalendarFeedDiscovery />
+      {children}
+    </DataContext.Provider>
+  );
 }
 
 function mergeDBNodesAndNodes(
@@ -46,7 +65,7 @@ function mergeDBNodesAndNodes(
 
 function mergeKnowledgeDBs(a: KnowledgeDBs, b: KnowledgeDBs): KnowledgeDBs {
   const allUsers = a.keySeq().toSet().union(b.keySeq().toSet());
-  return Map<PublicKey, KnowledgeData>(
+  return Map<SourceId, KnowledgeData>(
     allUsers.toArray().map((userPK) => {
       return [userPK, mergeDBNodesAndNodes(a.get(userPK), b.get(userPK))];
     })
@@ -56,26 +75,45 @@ function mergeKnowledgeDBs(a: KnowledgeDBs, b: KnowledgeDBs): KnowledgeDBs {
 export function MergeKnowledgeDB({
   children,
   knowledgeDBs,
+  graphIndex,
+  documents,
+  documentByFilePath,
+  pull,
 }: {
   children: React.ReactNode;
   knowledgeDBs?: KnowledgeDBs;
+  graphIndex?: GraphIndex;
+  documents?: Map<string, KnowstrDocument>;
+  documentByFilePath?: Map<string, KnowstrDocument>;
+  pull?: PullOverlayData;
 }): JSX.Element {
   const data = useData();
   const { temporaryEvents } = data.publishEventsStatus;
-  const myself = data.user.publicKey;
 
   const documentDBs = useDocumentKnowledgeDBs();
-  const semanticIndex = useDocumentSemanticIndex();
-  const snapshotNodes = useDocumentSnapshotNodes();
+  const documentGraphIndex = useDocumentGraphIndex();
+  const documentRecords = useDocuments();
+  const documentsByPath = useDocumentByFilePath();
   const mergedDataDBs = mergeKnowledgeDBs(data.knowledgeDBs, documentDBs);
   const baseDBs = knowledgeDBs
     ? mergeKnowledgeDBs(knowledgeDBs, mergedDataDBs)
     : mergedDataDBs;
-
+  const mergedGraphIndex = graphIndex
+    ? mergeGraphIndexes(
+        mergeGraphIndexes(data.graphIndex, documentGraphIndex),
+        graphIndex
+      )
+    : mergeGraphIndexes(data.graphIndex, documentGraphIndex);
+  const mergedDocuments = documents
+    ? documentRecords.merge(data.documents).merge(documents)
+    : documentRecords.merge(data.documents);
+  const mergedDocumentByFilePath = documentByFilePath
+    ? documentsByPath.merge(data.documentByFilePath).merge(documentByFilePath)
+    : documentsByPath.merge(data.documentByFilePath);
   const injectedDBs = injectEmptyNodesIntoKnowledgeDBs(
     baseDBs,
     temporaryEvents,
-    myself
+    LOCAL
   );
 
   return (
@@ -83,10 +121,13 @@ export function MergeKnowledgeDB({
       value={{
         ...data,
         knowledgeDBs: injectedDBs,
-        semanticIndex,
-        snapshotNodes,
+        graphIndex: mergedGraphIndex,
+        documents: mergedDocuments,
+        documentByFilePath: mergedDocumentByFilePath,
+        pull: pull ?? data.pull,
       }}
     >
+      <CalendarFeedDiscovery />
       {children}
     </DataContext.Provider>
   );

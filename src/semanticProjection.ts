@@ -1,200 +1,69 @@
-import { List, Map, OrderedMap, Set as ImmutableSet } from "immutable";
+import { List, Set as ImmutableSet } from "immutable";
 import {
-  EMPTY_SEMANTIC_ID,
-  getChildNodes,
-  shortID,
-  splitID,
   isSearchId,
-  parseSearchId,
-  itemPassesFilters,
-  getNodeSemanticID,
-  getSemanticID,
   getNodeContext,
-  getNodeText,
   getNode,
-  resolveNode,
-  isRefNode,
-} from "./connections";
-import { suggestionSettings } from "./constants";
-import { LOG_ROOT_ROLE } from "./systemRoots";
-import { computeVersionDiff } from "./domain/snapshotBaseline";
-
-type FooterTypeFilters = (
-  | Relevance
-  | "suggestions"
-  | "versions"
-  | "incoming"
-  | "contains"
-)[];
+  nodePathLabel,
+} from "./core/connections";
+import { getAllLinks } from "./core/nodeSpans";
+import { fileLinkIndexKey } from "./core/linkPath";
+import { LOG_ROOT_ROLE } from "./core/systemRoots";
+import { findReciprocalLinkItem } from "./buildReferenceRow";
+import {
+  GraphLookup,
+  ResolvedNode,
+  getNodeInSource,
+  graphLookupFromData,
+  linkSpeaker,
+  lookupNodes,
+  resolveAuthoredFirst,
+} from "./core/graphLookup";
+import { nodeRefKey } from "./core/nodeRef";
 
 type ReferencedByRef = {
-  nodeID: LongID;
+  nodeID: ID;
+  sourceId: SourceId;
   context: Context;
   updated: number;
 };
-
-function getFallbackSemanticText(semanticID?: ID): string {
-  if (!semanticID) {
-    return "";
-  }
-  const localID = shortID(semanticID as ID) as ID;
-  if (localID === EMPTY_SEMANTIC_ID) {
-    return "";
-  }
-  if (isSearchId(localID)) {
-    return parseSearchId(localID) || "";
-  }
-  return "";
-}
-
-function getConcreteNodesForSemanticID(
-  knowledgeDBs: KnowledgeDBs,
-  semanticID: ID,
-  author: PublicKey
-): GraphNode[] {
-  if (isSearchId(semanticID as ID)) {
-    return [];
-  }
-
-  const directNode = getNode(knowledgeDBs, semanticID, author);
-  if (directNode) {
-    if (isRefNode(directNode)) {
-      return [];
-    }
-    return [directNode];
-  }
-
-  const [remote, localID] = splitID(semanticID as ID);
-  const preferredAuthor = remote || author;
-  const preferredDB = knowledgeDBs.get(preferredAuthor);
-  const otherDBs = remote
-    ? []
-    : knowledgeDBs
-        .filter((_, pk) => pk !== preferredAuthor)
-        .valueSeq()
-        .toArray();
-  const candidateDBs = [preferredDB, ...otherDBs].filter(
-    (db): db is KnowledgeData => db !== undefined
-  );
-
-  return List(
-    candidateDBs.flatMap((db) =>
-      db.nodes
-        .valueSeq()
-        .filter(
-          (node) =>
-            !isRefNode(node) &&
-            (shortID(getNodeSemanticID(node)) === localID ||
-              node.text === localID)
-        )
-        .toArray()
-    )
-  )
-    .sort((left, right) => {
-      const leftExact = shortID(getNodeSemanticID(left)) === localID ? 0 : 1;
-      const rightExact = shortID(getNodeSemanticID(right)) === localID ? 0 : 1;
-      if (leftExact !== rightExact) {
-        return leftExact - rightExact;
-      }
-      const leftPreferred = left.author === preferredAuthor ? 0 : 1;
-      const rightPreferred = right.author === preferredAuthor ? 0 : 1;
-      if (leftPreferred !== rightPreferred) {
-        return leftPreferred - rightPreferred;
-      }
-      return right.updated - left.updated;
-    })
-    .toArray();
-}
-
-function getConcreteNodeForSemanticID(
-  knowledgeDBs: KnowledgeDBs,
-  semanticID: ID,
-  author: PublicKey
-): GraphNode | undefined {
-  return getConcreteNodesForSemanticID(knowledgeDBs, semanticID, author)[0];
-}
-
-export function getTextForSemanticID(
-  knowledgeDBs: KnowledgeDBs,
-  semanticID: ID,
-  author: PublicKey
-): string | undefined {
-  const localID = shortID(semanticID as ID) as ID;
-  if (isSearchId(localID)) {
-    return parseSearchId(localID) || "";
-  }
-
-  const directNode = getNode(knowledgeDBs, semanticID, author);
-  if (directNode) {
-    if (isRefNode(directNode)) {
-      return undefined;
-    }
-    return getNodeText(directNode);
-  }
-
-  const node = getConcreteNodeForSemanticID(knowledgeDBs, semanticID, author);
-  const nodeText = getNodeText(node);
-  if (nodeText !== undefined) {
-    return nodeText;
-  }
-
-  const fallbackText = getFallbackSemanticText(semanticID);
-  return fallbackText !== "" || localID === EMPTY_SEMANTIC_ID
-    ? fallbackText
-    : undefined;
-}
 
 function getContextKey(context: Context): string {
   return context.join(":");
 }
 
-function contextsSemanticallyMatch(
-  leftContext: Context,
-  rightContext: Context
-): boolean {
+function contextsMatch(leftContext: Context, rightContext: Context): boolean {
   return getContextKey(leftContext) === getContextKey(rightContext);
 }
 
-function getSemanticCandidates(
-  semanticIndex: SemanticIndex,
-  semanticKey: string
-): List<GraphNode> {
-  const nodeIDs = semanticIndex.semantic.get(semanticKey);
-  if (!nodeIDs) {
-    return List<GraphNode>();
-  }
-
-  return List(
-    [...nodeIDs]
-      .map((nodeID) => semanticIndex.nodeByID.get(nodeID))
-      .filter((node): node is GraphNode => node !== undefined)
-      .sort((left, right) => right.updated - left.updated)
+function getNodeCandidates(graph: GraphLookup, nodeID: ID): List<ResolvedNode> {
+  return List(lookupNodes(graph, nodeID)).sortBy(
+    (resolved) => -resolved.node.updated
   );
 }
 
 export function findRefsToNode(
-  knowledgeDBs: KnowledgeDBs,
-  semanticIndex: SemanticIndex,
-  semanticID: ID,
+  graph: GraphLookup,
+  nodeID: ID,
   filterContext?: Context,
-  targetAuthor?: PublicKey,
+  targetAuthor?: SourceId,
   targetRoot?: ID
 ): List<ReferencedByRef> {
-  const targetSemanticKey =
-    targetAuthor && targetRoot ? semanticID : (shortID(semanticID as ID) as ID);
-  const resolvedRefs = getSemanticCandidates(semanticIndex, targetSemanticKey)
-    .filter((node) => !isSearchId(getSemanticID(knowledgeDBs, node)))
-    .filter(
-      (node) =>
-        !getNodeContext(knowledgeDBs, node).some((id) => isSearchId(id as ID))
+  const { knowledgeDBs } = graph;
+  const resolvedRefs = getNodeCandidates(graph, nodeID)
+    .filter(({ node }) => !isSearchId(node.id))
+    .filter(({ node, ref }) =>
+      getNodeContext(knowledgeDBs, node, ref.sourceId).every(
+        (id) => !isSearchId(id)
+      )
     )
-    .map((node) => ({
+    .map(({ node, ref }) => ({
       ref: {
         nodeID: node.id,
-        context: getNodeContext(knowledgeDBs, node),
+        sourceId: ref.sourceId,
+        context: getNodeContext(knowledgeDBs, node, ref.sourceId),
         updated: node.updated,
       },
-      author: node.author,
+      author: ref.sourceId,
       root: node.root,
     }))
     .toList();
@@ -207,7 +76,7 @@ export function findRefsToNode(
           author === targetAuthor &&
           root === targetRoot
             ? ref.context.equals(filterContext)
-            : contextsSemanticallyMatch(ref.context, filterContext)
+            : contextsMatch(ref.context, filterContext)
         )
         .map(({ ref }) => ref)
         .toList()
@@ -220,372 +89,198 @@ export function findRefsToNode(
     .toList();
 }
 
-function getRefContextKey(
-  _knowledgeDBs: KnowledgeDBs,
-  ref: ReferencedByRef
-): string {
-  return getContextKey(ref.context);
-}
-
-function contextKeyForCref(
-  knowledgeDBs: KnowledgeDBs,
-  crefID: ID,
-  effectiveAuthor: PublicKey
-): string | undefined {
-  const targetNode = resolveNode(
-    knowledgeDBs,
-    getNode(knowledgeDBs, crefID, effectiveAuthor)
-  );
-  if (!targetNode) {
-    return undefined;
-  }
-  return getContextKey(getNodeContext(knowledgeDBs, targetNode));
-}
-
-function coveredContextKeys(
-  knowledgeDBs: KnowledgeDBs,
-  crefIDs: List<ID>,
-  effectiveAuthor: PublicKey
-): ImmutableSet<string> {
-  return crefIDs.reduce((acc, crefID) => {
-    const key = contextKeyForCref(knowledgeDBs, crefID, effectiveAuthor);
-    return key !== undefined ? acc.add(key) : acc;
-  }, ImmutableSet<string>());
-}
-
 function isInSystemRoot(
   knowledgeDBs: KnowledgeDBs,
   node: GraphNode | undefined,
+  sourceId: SourceId,
   systemRole: RootSystemRole
 ): boolean {
   if (!node) {
     return false;
   }
-  const rootNode = getNode(knowledgeDBs, node.root, node.author);
+  const rootNode = getNode(knowledgeDBs, node.root, sourceId);
   return rootNode?.systemRole === systemRole;
 }
 
-export function deduplicateRefsByContext(
-  refs: List<ReferencedByRef>,
-  knowledgeDBs: KnowledgeDBs,
-  preferAuthor?: PublicKey
-): List<ReferencedByRef> {
-  return refs
-    .groupBy((ref) => getRefContextKey(knowledgeDBs, ref))
-    .map(
-      (group) =>
-        group
-          .sortBy((ref) => {
-            const [author] = splitID(ref.nodeID);
-            const isOther =
-              preferAuthor && author !== undefined && author !== preferAuthor
-                ? 1
-                : 0;
-            return [isOther, -ref.updated];
-          })
-          .first()!
-    )
-    .valueSeq()
-    .toList();
+function incomingFileLinkSourceRefs(
+  graphIndex: GraphIndex,
+  rootFilePath: string | undefined,
+  rootAuthor: SourceId | undefined
+): NodeRef[] {
+  if (!rootFilePath || !rootAuthor) return [];
+  const key = fileLinkIndexKey(rootAuthor, rootFilePath);
+  return graphIndex.incomingFileLinks.get(key) ?? [];
+}
+
+function uniqueNodes(nodes: ResolvedNode[]): ResolvedNode[] {
+  const seen = new globalThis.Set<string>();
+  return nodes.filter((node) => {
+    const key = nodeRefKey(node.ref);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function uniqueRefs(refs: NodeRef[]): NodeRef[] {
+  const seen = new globalThis.Set<string>();
+  return refs.filter((ref) => {
+    const key = nodeRefKey(ref);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function localChildLinksTo(
+  graph: GraphLookup,
+  target: ResolvedNode,
+  sourceRoot: ResolvedNode
+): boolean {
+  return target.node.children.some((childID) => {
+    const child = getNodeInSource(graph, {
+      sourceId: target.ref.sourceId,
+      id: childID,
+    })?.node;
+    const judged =
+      child?.relevance !== undefined || child?.argument !== undefined;
+    if (childID === sourceRoot.node.id) {
+      return judged;
+    }
+    return child
+      ? judged &&
+          getAllLinks(child).some(
+            (link) => link.targetID === sourceRoot.node.id
+          )
+      : false;
+  });
+}
+
+function sourceRootCoveredByTarget(
+  graph: GraphLookup,
+  source: ResolvedNode,
+  target: ResolvedNode | undefined
+): boolean {
+  if (!target) {
+    return false;
+  }
+  const sourceRoot = getNodeInSource(graph, {
+    sourceId: source.ref.sourceId,
+    id: source.node.root,
+  });
+  return sourceRoot ? localChildLinksTo(graph, target, sourceRoot) : false;
+}
+
+function pulledSourceOrder(data: Data, sourceId: SourceId): number | undefined {
+  const indexes = [...(data.pull?.matchedSourceIdsByPaneId.values() ?? [])]
+    .map((sourceIds) => sourceIds.indexOf(sourceId))
+    .filter((index) => index >= 0);
+  return indexes.length === 0 ? undefined : Math.min(...indexes);
 }
 
 export function getIncomingCrefsForNode(
-  knowledgeDBs: KnowledgeDBs,
-  semanticIndex: SemanticIndex,
-  visibleAuthors: ImmutableSet<PublicKey>,
-  currentSemanticID: ID,
-  parentNodeID: LongID | undefined,
-  currentNodeID: LongID | undefined,
-  effectiveAuthor: PublicKey,
-  currentItems?: List<GraphNode>
-): List<LongID> {
-  const outgoingCrefIDs = (currentItems || List<GraphNode>())
-    .filter(isRefNode)
-    .map((item) => item.id)
-    .toList();
-  const covered = coveredContextKeys(
-    knowledgeDBs,
-    outgoingCrefIDs,
-    effectiveAuthor
-  );
-  const outgoingTargetRelIDs = (currentItems || List<GraphNode>()).reduce(
-    (acc, item) => {
-      const targetNode = resolveNode(knowledgeDBs, item);
-      return targetNode ? acc.add(targetNode.id) : acc;
-    },
-    ImmutableSet<LongID>()
-  );
+  data: Data,
+  visibleAuthors: ImmutableSet<SourceId>,
+  currentNodeID: ID | undefined,
+  itemsSourceId: SourceId,
+  expansionPath: readonly ID[],
+  currentItems?: List<GraphNode>,
+  currentNodeFilePath?: string
+): List<NodeRef> {
+  const graph = graphLookupFromData(data);
+  const { graphIndex, knowledgeDBs } = graph;
+  const current = currentItems || List<GraphNode>();
+  const firstCurrent = current.first();
+  const target = (() => {
+    if (currentNodeID) {
+      return resolveAuthoredFirst(graph, currentNodeID, itemsSourceId);
+    }
+    return firstCurrent
+      ? getNodeInSource(graph, { sourceId: itemsSourceId, id: firstCurrent.id })
+      : undefined;
+  })();
 
-  const refs = List(
-    currentNodeID
-      ? [
-          ...(semanticIndex.incomingCrefs.get(currentNodeID) ||
-            new globalThis.Set<LongID>()),
-        ]
-          .map((nodeID) => semanticIndex.nodeByID.get(nodeID))
-          .filter((node): node is GraphNode => node !== undefined)
-          .filter((node) => visibleAuthors.has(node.author))
-          .filter((node) => node.id !== parentNodeID)
-          .filter((node) => node.id !== currentNodeID)
-          .filter(
-            (node) =>
-              node.systemRole !== LOG_ROOT_ROLE &&
-              !isInSystemRoot(knowledgeDBs, node, LOG_ROOT_ROLE)
-          )
-          .filter((node) => !outgoingTargetRelIDs.has(node.id))
-          .map((node) => ({
-            nodeID: node.id,
-            context: getNodeContext(knowledgeDBs, node),
-            updated: node.updated,
-          }))
-      : []
-  );
-
-  const deduped = deduplicateRefsByContext(refs, knowledgeDBs, effectiveAuthor);
-  return deduped
-    .filter((ref) => !covered.has(getRefContextKey(knowledgeDBs, ref)))
-    .sortBy((ref) => `${-ref.updated}:${ref.context.join(":")}`)
-    .map((ref) => ref.nodeID)
-    .toList();
-}
-
-type AlternativeFooterResult = {
-  suggestions: List<ID>;
-  versionMetas: Map<LongID, VersionMeta>;
-};
-
-const EMPTY_ALTERNATIVE_FOOTER_RESULT: AlternativeFooterResult = {
-  suggestions: List<ID>(),
-  versionMetas: Map<LongID, VersionMeta>(),
-};
-
-function isVisibleVersion(
-  node: GraphNode,
-  visibleAuthors: ImmutableSet<PublicKey>
-): boolean {
-  return !isRefNode(node) && visibleAuthors.has(node.author);
-}
-
-function getPastVersions(
-  semanticIndex: SemanticIndex,
-  visibleAuthors: ImmutableSet<PublicKey>,
-  currentNode: GraphNode
-): List<GraphNode> {
-  if (!currentNode.basedOn) {
-    return List<GraphNode>();
-  }
-
-  const pastVersion = semanticIndex.nodeByID.get(currentNode.basedOn);
-  if (!pastVersion) {
-    return List<GraphNode>();
-  }
-
-  const visiblePast = isVisibleVersion(pastVersion, visibleAuthors)
-    ? List<GraphNode>([pastVersion])
-    : List<GraphNode>();
-
-  return visiblePast
-    .concat(getPastVersions(semanticIndex, visibleAuthors, pastVersion))
-    .toList();
-}
-
-function getFutureVersions(
-  semanticIndex: SemanticIndex,
-  visibleAuthors: ImmutableSet<PublicKey>,
-  currentNode: GraphNode,
-  excludedIDs: ImmutableSet<LongID> = ImmutableSet<LongID>(),
-  visited: ImmutableSet<LongID> = ImmutableSet<LongID>([currentNode.id])
-): List<GraphNode> {
-  const futureIDs = List([
-    ...(semanticIndex.basedOnIndex.get(currentNode.id) || []),
-  ] as LongID[]).filter((nextID) => !visited.has(nextID));
-
-  return futureIDs
-    .reduce((collected, futureID) => {
-      const futureVersion = semanticIndex.nodeByID.get(futureID);
-      if (!futureVersion) {
-        return collected;
+  const graphLinkRefs = (() => {
+    if (!currentNodeID) {
+      return [];
+    }
+    const sourceScopedRefs =
+      graphIndex.incomingCrefsByTarget.get(
+        nodeRefKey({ sourceId: itemsSourceId, id: currentNodeID })
+      ) ?? [];
+    const unscopedRefs = graphIndex.incomingCrefs.get(currentNodeID) ?? [];
+    return uniqueRefs([...sourceScopedRefs, ...unscopedRefs]);
+  })();
+  const graphLinkSourceNodes = graphLinkRefs
+    .map((ref) => getNodeInSource(graph, ref))
+    .filter((node): node is ResolvedNode => node !== undefined);
+  const fileLinkSourceNodes = incomingFileLinkSourceRefs(
+    graphIndex,
+    currentNodeFilePath,
+    itemsSourceId
+  )
+    .map((ref) => getNodeInSource(graph, ref))
+    .filter((node): node is ResolvedNode => node !== undefined);
+  const sourceNodes = uniqueNodes([
+    ...graphLinkSourceNodes,
+    ...fileLinkSourceNodes,
+  ])
+    // A reference the view is currently looking through — its carrying
+    // row sits on the active expansion path — never queues under itself.
+    .filter((source) => !expansionPath.includes(source.node.id))
+    .filter(
+      (source) =>
+        target === undefined ||
+        findReciprocalLinkItem(graph, data, source, target) === undefined
+    )
+    .map((source) => linkSpeaker(graph, source))
+    .filter((source) => !sourceRootCoveredByTarget(graph, source, target));
+  const seenIncomingIds = new globalThis.Set<ID>();
+  const visibleSourceNodes = uniqueNodes(sourceNodes)
+    .filter(({ ref }) => visibleAuthors.has(ref.sourceId))
+    .filter(
+      ({ ref }) =>
+        target === undefined ||
+        ref.sourceId !== target.ref.sourceId ||
+        ref.id !== target.ref.id
+    )
+    .filter(
+      ({ ref, node }) =>
+        node.systemRole !== LOG_ROOT_ROLE &&
+        !isInSystemRoot(knowledgeDBs, node, ref.sourceId, LOG_ROOT_ROLE)
+    )
+    .sort((left, right) => {
+      const leftPullOrder = pulledSourceOrder(data, left.ref.sourceId);
+      const rightPullOrder = pulledSourceOrder(data, right.ref.sourceId);
+      if (leftPullOrder !== undefined && rightPullOrder !== undefined) {
+        return leftPullOrder - rightPullOrder;
       }
+      if (leftPullOrder !== undefined) {
+        return 1;
+      }
+      if (rightPullOrder !== undefined) {
+        return -1;
+      }
+      return nodePathLabel(
+        knowledgeDBs,
+        left.node,
+        left.ref.sourceId
+      ).localeCompare(
+        nodePathLabel(knowledgeDBs, right.node, right.ref.sourceId)
+      );
+    })
+    .filter(({ ref }) => {
+      if (seenIncomingIds.has(ref.id)) {
+        return false;
+      }
+      seenIncomingIds.add(ref.id);
+      return true;
+    });
 
-      const visibleFuture =
-        isVisibleVersion(futureVersion, visibleAuthors) &&
-        !excludedIDs.has(futureVersion.id)
-          ? List<GraphNode>([futureVersion])
-          : List<GraphNode>();
-
-      return collected
-        .concat(visibleFuture)
-        .concat(
-          getFutureVersions(
-            semanticIndex,
-            visibleAuthors,
-            futureVersion,
-            excludedIDs,
-            visited.add(futureID) as ImmutableSet<LongID>
-          )
-        )
-        .toList();
-    }, List<GraphNode>())
-    .toList();
-}
-
-function getVersions(
-  semanticIndex: SemanticIndex,
-  visibleAuthors: ImmutableSet<PublicKey>,
-  currentNode: GraphNode
-): List<GraphNode> {
-  const pastVersions = getPastVersions(
-    semanticIndex,
-    visibleAuthors,
-    currentNode
+  return List(
+    visibleSourceNodes.map(({ ref }) => ({
+      sourceId: ref.sourceId,
+      id: ref.id,
+    }))
   );
-  const lineageNodes = List<GraphNode>([currentNode]).concat(pastVersions);
-  const lineageIDs = lineageNodes
-    .map((node) => node.id as LongID)
-    .toSet() as ImmutableSet<LongID>;
-  const futureVersions = lineageNodes.reduce(
-    (collected, lineageNode) =>
-      collected
-        .concat(
-          getFutureVersions(
-            semanticIndex,
-            visibleAuthors,
-            lineageNode,
-            lineageIDs
-          )
-        )
-        .toList(),
-    List<GraphNode>()
-  );
-
-  return pastVersions
-    .concat(futureVersions)
-    .groupBy((node) => node.id)
-    .map((group) => group.first())
-    .valueSeq()
-    .filter((node): node is GraphNode => node !== undefined)
-    .sortBy((node) => -node.updated)
-    .toList();
-}
-
-export function getAlternativeFooterData(
-  knowledgeDBs: KnowledgeDBs,
-  semanticIndex: SemanticIndex,
-  visibleAuthors: ImmutableSet<PublicKey>,
-  filterTypes: FooterTypeFilters,
-  currentNode?: GraphNode,
-  showSuggestions: boolean = true,
-  snapshotNodes: SnapshotNodes = Map<string, Map<string, GraphNode>>()
-): AlternativeFooterResult {
-  if (!currentNode || !filterTypes || filterTypes.length === 0) {
-    return EMPTY_ALTERNATIVE_FOOTER_RESULT;
-  }
-
-  const suggestionsEnabled =
-    showSuggestions && filterTypes.includes("suggestions");
-  const versionsEnabled = filterTypes.includes("versions");
-
-  if (!suggestionsEnabled && !versionsEnabled) {
-    return EMPTY_ALTERNATIVE_FOOTER_RESULT;
-  }
-
-  const currentNodeChildren = getChildNodes(
-    knowledgeDBs,
-    currentNode,
-    currentNode.author
-  );
-  const currentOriginKeys = currentNodeChildren
-    .map((item) => (item.basedOn ?? item.id) as string)
-    .toSet();
-  const currentSemanticIDs = currentNodeChildren
-    .map((item) => getNodeSemanticID(item) as string)
-    .toSet();
-  const currentFilteredOutOriginKeys = currentNodeChildren
-    .filter((item) => !itemPassesFilters(item, filterTypes))
-    .map((item) => (item.basedOn ?? item.id) as string)
-    .toSet();
-  const declinedTargetIDs = currentNodeChildren
-    .filter((item) => isRefNode(item) && item.relevance === "not_relevant")
-    .flatMap((item) => (item.targetID ? [item.targetID] : []))
-    .toSet();
-  const existingCrefTargetIDs = currentNodeChildren
-    .map((item) => (isRefNode(item) ? item.targetID : undefined))
-    .filter((id): id is LongID => !!id)
-    .toSet();
-
-  const versionNodes = getVersions(semanticIndex, visibleAuthors, currentNode);
-  const versionDiffs = versionNodes.map((versionNode) =>
-    computeVersionDiff(snapshotNodes, knowledgeDBs, currentNode, versionNode)
-  );
-
-  const allSuggestionCandidates = suggestionsEnabled
-    ? versionDiffs
-        .filter(({ node }) => !declinedTargetIDs.has(node.id))
-        .reduce(
-          (acc, { additions }) =>
-            additions
-              .filter((item) => itemPassesFilters(item, filterTypes))
-              .reduce((itemAcc, item) => {
-                const originKey = (item.basedOn ?? item.id) as string;
-                if (
-                  currentOriginKeys.has(originKey) ||
-                  currentSemanticIDs.has(getNodeSemanticID(item) as string) ||
-                  itemAcc.has(originKey)
-                ) {
-                  return itemAcc;
-                }
-                return itemAcc.set(originKey, item.id);
-              }, acc),
-          OrderedMap<string, ID>()
-        )
-    : OrderedMap<string, ID>();
-
-  const suggestions = allSuggestionCandidates
-    .valueSeq()
-    .take(suggestionSettings.maxSuggestions)
-    .toList();
-
-  const displayedSuggestionOriginKeys = allSuggestionCandidates
-    .keySeq()
-    .take(suggestionSettings.maxSuggestions)
-    .toSet();
-
-  const versionMetas = versionsEnabled
-    ? versionDiffs
-        .filter(({ node }) => !existingCrefTargetIDs.has(node.id))
-        .reduce((acc, { node, additions, deletions }) => {
-          const addCount = additions.filter(
-            (item) =>
-              itemPassesFilters(item, filterTypes) &&
-              !currentOriginKeys.has((item.basedOn ?? item.id) as string) &&
-              !currentSemanticIDs.has(getNodeSemanticID(item) as string)
-          ).size;
-          const uncoveredAddCount =
-            addCount -
-            additions.filter(
-              (item) =>
-                itemPassesFilters(item, filterTypes) &&
-                !currentOriginKeys.has((item.basedOn ?? item.id) as string) &&
-                !currentSemanticIDs.has(getNodeSemanticID(item) as string) &&
-                displayedSuggestionOriginKeys.has(
-                  (item.basedOn ?? item.id) as string
-                )
-            ).size;
-          const removeCount = deletions.filter(
-            (item) =>
-              currentOriginKeys.has(item.id as string) &&
-              !currentFilteredOutOriginKeys.has(item.id as string)
-          ).size;
-          if (uncoveredAddCount <= 0 && removeCount <= 0) {
-            return acc;
-          }
-          return acc.set(node.id, {
-            updated: node.updated,
-            addCount,
-            removeCount,
-          });
-        }, Map<LongID, VersionMeta>())
-    : Map<LongID, VersionMeta>();
-
-  return { suggestions, versionMetas };
 }

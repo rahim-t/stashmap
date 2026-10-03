@@ -1,15 +1,16 @@
 import React from "react";
-import { cleanup, screen } from "@testing-library/react";
+import { cleanup, screen, waitFor } from "@testing-library/react";
+import { Route, Routes } from "react-router-dom";
 import userEvent from "@testing-library/user-event";
 import { Event } from "nostr-tools";
 import {
   ALICE,
-  renderTree,
   renderWithTestData,
   RootViewOrPaneIsLoading,
   setup,
   type,
   expectTree,
+  requireUser,
 } from "./utils.test";
 import { MockRelayPool, mockRelayPool } from "./nostrMock.test";
 import {
@@ -21,7 +22,14 @@ import {
   removeOutboxEvent,
   OutboxEntry,
 } from "./infra/nostr/cache/indexedDB";
-import { PaneView } from "./components/Workspace";
+import { PaneView } from "./editor/Workspace";
+import { RelaysWrapper } from "./editor/Relays";
+import {
+  KIND_KNOWLEDGE_DEPOSIT,
+  KIND_KNOWLEDGE_DOCUMENT,
+  KIND_SETTINGS,
+} from "./nostr";
+import { newStorageKey } from "./storageEncryption";
 
 jest.mock("./infra/nostr/cache/indexedDB");
 
@@ -99,7 +107,15 @@ beforeEach(() => {
 
 test("published events are cached and available on reload", async () => {
   const [alice] = setup([ALICE]);
-  renderTree(alice);
+  renderWithTestData(
+    <RootViewOrPaneIsLoading>
+      <PaneView />
+    </RootViewOrPaneIsLoading>,
+    {
+      ...alice(),
+      db: { __fake: true } as never,
+    }
+  );
 
   await type("My Notes{Enter}{Tab}Spain{Enter}France{Escape}");
   await expectTree(`
@@ -114,13 +130,109 @@ My Notes
     ...alice(),
     relayPool: mockRelayPool(),
   });
-  renderTree(freshAlice);
+  renderWithTestData(
+    <RootViewOrPaneIsLoading>
+      <PaneView />
+    </RootViewOrPaneIsLoading>,
+    {
+      ...freshAlice(),
+      db: { __fake: true } as never,
+    }
+  );
 
   await expectTree(`
 My Notes
   Spain
   France
     `);
+}, 20000);
+
+test("queued settings activate before the next save and status separates routes", async () => {
+  const [alice] = setup([ALICE]);
+  const relayPool = mockRelayPool();
+  const publish = relayPool.publish.bind(relayPool);
+  const acknowledgements: Array<() => void> = [];
+  jest.spyOn(relayPool, "publish").mockImplementation((relays, event) => {
+    const results = publish(relays, event);
+    if (event.kind !== KIND_SETTINGS) return results;
+    return results.map((result) =>
+      result.then(
+        () =>
+          new Promise<string>((resolve) => {
+            // eslint-disable-next-line functional/immutable-data
+            acknowledgements.push(() => resolve(""));
+          })
+      )
+    );
+  });
+  const db = await openDB();
+  if (!db) throw new Error("Missing test database");
+  const storageRelays = ["wss://storage.one/", "wss://storage.two/"];
+  const roomRelays = [
+    "wss://room.one/",
+    "wss://room.two/",
+    "wss://room.three/",
+  ];
+
+  renderWithTestData(
+    <Routes>
+      <Route path="/relays" element={<RelaysWrapper />} />
+      <Route
+        path="/"
+        element={
+          <RootViewOrPaneIsLoading>
+            <PaneView />
+          </RootViewOrPaneIsLoading>
+        }
+      />
+    </Routes>,
+    {
+      ...alice(),
+      db,
+      relayPool,
+      initialRoute: "/relays",
+      storageRelays,
+    }
+  );
+
+  await roomRelays.reduce(
+    (added, roomRelay) =>
+      added.then(async () => {
+        await userEvent.type(
+          screen.getByLabelText("add room relay"),
+          roomRelay
+        );
+        await userEvent.click(screen.getByLabelText("save room relay"));
+      }),
+    Promise.resolve()
+  );
+  await userEvent.click(screen.getByText("Save"));
+  await waitFor(() => expect(acknowledgements).toHaveLength(3));
+  expect(screen.getByText("Workspace Settings")).toBeDefined();
+
+  acknowledgements.forEach((acknowledge) => acknowledge());
+  await waitFor(() =>
+    expect(screen.queryByText("Workspace Settings")).toBeNull()
+  );
+
+  await type("Room Root{Enter}Published child{Escape}");
+  await waitFor(
+    () => {
+      const storage = relayPool
+        .getEvents()
+        .find((event) => event.kind === KIND_KNOWLEDGE_DOCUMENT);
+      const deposit = relayPool
+        .getEvents()
+        .find((event) => event.kind === KIND_KNOWLEDGE_DEPOSIT);
+      expect(storage?.relays).toEqual(storageRelays);
+      expect(deposit?.relays).toEqual(roomRelays);
+    },
+    { timeout: 10000 }
+  );
+
+  await userEvent.click(await screen.findByLabelText("sync status"));
+  expect(screen.getByLabelText("Storage relays")).toBeDefined();
+  expect(screen.getByLabelText("Room relays")).toBeDefined();
 }, 20000);
 
 test("status bar shows pending when outbox has events on reload", async () => {
@@ -130,11 +242,13 @@ test("status bar shows pending when outbox has events on reload", async () => {
   outboxStore.push({
     key: "node:abc",
     event: {
-      kind: 30023,
-      pubkey: alice().user.publicKey,
+      kind: KIND_KNOWLEDGE_DOCUMENT,
+      pubkey: requireUser(alice()).publicKey,
       created_at: 1,
       tags: [["d", "abc"]],
       content: "hello",
+      route: { kind: "storage" },
+      storageKey: newStorageKey(),
     },
     createdAt: Date.now(),
   });
@@ -142,11 +256,13 @@ test("status bar shows pending when outbox has events on reload", async () => {
   outboxStore.push({
     key: "node:def",
     event: {
-      kind: 30023,
-      pubkey: alice().user.publicKey,
+      kind: KIND_KNOWLEDGE_DOCUMENT,
+      pubkey: requireUser(alice()).publicKey,
       created_at: 2,
       tags: [["d", "def"]],
       content: "world",
+      route: { kind: "storage" },
+      storageKey: newStorageKey(),
     },
     createdAt: Date.now(),
   });
@@ -158,10 +274,11 @@ test("status bar shows pending when outbox has events on reload", async () => {
     {
       ...alice(),
       db: { __fake: true } as never,
+      relayPool: mockRelayPoolWithFailure("wss://relay.test.second.fail/"),
     }
   );
 
-  await screen.findByText("2 pending");
+  await screen.findByText(/2 pending/);
 }, 20000);
 
 test("relay results appear after queue flushes pending outbox events on reload", async () => {
@@ -171,11 +288,13 @@ test("relay results appear after queue flushes pending outbox events on reload",
   outboxStore.push({
     key: "node:abc",
     event: {
-      kind: 30023,
-      pubkey: alice().user.publicKey,
+      kind: KIND_KNOWLEDGE_DOCUMENT,
+      pubkey: requireUser(alice()).publicKey,
       created_at: 1,
       tags: [["d", "abc"]],
       content: "hello",
+      route: { kind: "storage" },
+      storageKey: newStorageKey(),
     },
     createdAt: Date.now(),
   });
@@ -183,11 +302,13 @@ test("relay results appear after queue flushes pending outbox events on reload",
   outboxStore.push({
     key: "node:def",
     event: {
-      kind: 30023,
-      pubkey: alice().user.publicKey,
+      kind: KIND_KNOWLEDGE_DOCUMENT,
+      pubkey: requireUser(alice()).publicKey,
       created_at: 2,
       tags: [["d", "def"]],
       content: "world",
+      route: { kind: "storage" },
+      storageKey: newStorageKey(),
     },
     createdAt: Date.now(),
   });
@@ -202,9 +323,7 @@ test("relay results appear after queue flushes pending outbox events on reload",
     }
   );
 
-  await screen.findByText("2 pending");
-
-  await userEvent.click(await screen.findByLabelText("publishing status"));
+  await userEvent.click(await screen.findByLabelText("sync status"));
   await screen.findByText("relay.test.first.success/");
 
   await screen.findByText("synced", {}, { timeout: 10000 });
@@ -219,11 +338,13 @@ test("partial relay failure shows correct per-relay counts", async () => {
   outboxStore.push({
     key: "node:aaa",
     event: {
-      kind: 30023,
-      pubkey: alice().user.publicKey,
+      kind: KIND_KNOWLEDGE_DOCUMENT,
+      pubkey: requireUser(alice()).publicKey,
       created_at: 1,
       tags: [["d", "aaa"]],
       content: "one",
+      route: { kind: "storage" },
+      storageKey: newStorageKey(),
     },
     createdAt: Date.now(),
   });
@@ -231,11 +352,13 @@ test("partial relay failure shows correct per-relay counts", async () => {
   outboxStore.push({
     key: "node:bbb",
     event: {
-      kind: 30023,
-      pubkey: alice().user.publicKey,
+      kind: KIND_KNOWLEDGE_DOCUMENT,
+      pubkey: requireUser(alice()).publicKey,
       created_at: 2,
       tags: [["d", "bbb"]],
       content: "two",
+      route: { kind: "storage" },
+      storageKey: newStorageKey(),
     },
     createdAt: Date.now(),
   });
@@ -251,11 +374,9 @@ test("partial relay failure shows correct per-relay counts", async () => {
     }
   );
 
-  await screen.findByText("2 pending");
-
   await screen.findByText(/pending.*3\/4 relays/, {}, { timeout: 10000 });
 
-  await userEvent.click(await screen.findByLabelText("publishing status"));
+  await userEvent.click(await screen.findByLabelText("sync status"));
   await screen.findByText("relay.test.second.fail/");
   await screen.findByText("relay.test.first.success/");
   await screen.findAllByText("0/2");

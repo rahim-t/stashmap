@@ -1,0 +1,364 @@
+/* eslint-disable @typescript-eslint/no-use-before-define, functional/immutable-data, functional/no-let */
+import { List, Set, Map } from "immutable";
+import { SEARCH_PREFIX } from "./constants";
+import { nodeText } from "./nodeSpans";
+
+export const EMPTY_NODE_ID: ID = "";
+
+export type TextSeed = {
+  text: string;
+};
+
+export type RefTargetSeed = {
+  targetID: ID;
+  linkText?: string;
+};
+
+export type DocumentLinkTargetSeed = {
+  sourceId: SourceId;
+  docId: string;
+  filePath?: string;
+  linkText?: string;
+};
+
+export function createRefTarget(
+  targetID: ID,
+  linkText?: string
+): RefTargetSeed {
+  return { targetID, linkText };
+}
+
+export function createDocumentLinkTarget(
+  sourceId: SourceId,
+  docId: string,
+  filePath?: string,
+  linkText?: string
+): DocumentLinkTargetSeed {
+  return {
+    sourceId,
+    docId,
+    ...(filePath !== undefined ? { filePath } : {}),
+    linkText,
+  };
+}
+
+export function isSearchId(id: ID): boolean {
+  return id.startsWith(SEARCH_PREFIX);
+}
+
+export function createSearchId(query: string): ID {
+  return `${SEARCH_PREFIX}${query}`;
+}
+
+export function parseSearchId(id: ID): string | undefined {
+  if (!isSearchId(id)) {
+    return undefined;
+  }
+  return id.slice(SEARCH_PREFIX.length);
+}
+
+export function getNodeText(node: GraphNode | undefined): string | undefined {
+  if (!node) {
+    return undefined;
+  }
+  const text = nodeText(node);
+  if (text !== "") {
+    return text;
+  }
+  return isSearchId(node.id) ? parseSearchId(node.id) || "" : undefined;
+}
+
+const nodeContextCache = new WeakMap<
+  KnowledgeData,
+  globalThis.Map<string, Context>
+>();
+
+function getNodeContextIndex(
+  db: KnowledgeData
+): globalThis.Map<string, Context> {
+  const cached = nodeContextCache.get(db);
+  if (cached) {
+    return cached;
+  }
+  const index = new globalThis.Map<string, Context>();
+  nodeContextCache.set(db, index);
+  return index;
+}
+
+export function getNodeContext(
+  knowledgeDBs: KnowledgeDBs,
+  node: GraphNode,
+  sourceId: SourceId
+): Context {
+  const db = knowledgeDBs.get(sourceId);
+  const nodeKey = node.id;
+  if (db) {
+    const cached = getNodeContextIndex(db).get(nodeKey);
+    if (cached) {
+      return cached;
+    }
+  }
+
+  const fallbackContext = List<ID>();
+  if (!node.parent) {
+    if (db) {
+      getNodeContextIndex(db).set(nodeKey, fallbackContext);
+    }
+    return fallbackContext;
+  }
+
+  const visited = new globalThis.Set<string>([nodeKey]);
+  const parentChain: GraphNode[] = [];
+  let currentParentID: ID | undefined = node.parent;
+
+  while (currentParentID) {
+    const parentKey = currentParentID;
+    if (visited.has(parentKey)) {
+      if (db) {
+        getNodeContextIndex(db).set(nodeKey, fallbackContext);
+      }
+      return fallbackContext;
+    }
+    visited.add(parentKey);
+
+    const parentNode = getNode(knowledgeDBs, currentParentID, sourceId);
+    if (!parentNode) {
+      if (db) {
+        getNodeContextIndex(db).set(nodeKey, fallbackContext);
+      }
+      return fallbackContext;
+    }
+    parentChain.unshift(parentNode);
+    currentParentID = parentNode.parent;
+  }
+
+  const derivedContext = parentChain.reduce(
+    (context, parentNode) => context.push(parentNode.id),
+    parentChain.length > 0
+      ? getNodeContext(knowledgeDBs, parentChain[0] as GraphNode, sourceId)
+      : List<ID>()
+  );
+  if (db) {
+    getNodeContextIndex(db).set(nodeKey, derivedContext);
+  }
+  return derivedContext;
+}
+
+export function getNodeStack(
+  knowledgeDBs: KnowledgeDBs,
+  node: GraphNode,
+  sourceId: SourceId
+): ID[] {
+  return [...getNodeContext(knowledgeDBs, node, sourceId).toArray(), node.id];
+}
+
+export function nodePathLabel(
+  knowledgeDBs: KnowledgeDBs,
+  node: GraphNode,
+  sourceId: SourceId
+): string {
+  return getNodeContext(knowledgeDBs, node, sourceId)
+    .map((nodeID) => getNode(knowledgeDBs, nodeID, sourceId))
+    .filter((pathNode): pathNode is GraphNode => pathNode !== undefined)
+    .map((pathNode) => nodeText(pathNode))
+    .push(nodeText(node))
+    .filter((label) => label !== "")
+    .join(" / ");
+}
+
+export function getNodeDepth(
+  knowledgeDBs: KnowledgeDBs,
+  node: GraphNode,
+  sourceId: SourceId
+): number {
+  return getNodeContext(knowledgeDBs, node, sourceId).size;
+}
+
+export function getNode(
+  knowledgeDBs: KnowledgeDBs,
+  nodeID: ID | undefined,
+  sourceId: SourceId
+): GraphNode | undefined {
+  if (!nodeID) {
+    return undefined;
+  }
+  return knowledgeDBs.get(sourceId)?.nodes.get(nodeID);
+}
+
+export function getChildNodes(
+  knowledgeDBs: KnowledgeDBs,
+  node: GraphNode,
+  sourceId: SourceId
+): List<GraphNode> {
+  return node.children.reduce((acc, childID) => {
+    const childNode = getNode(knowledgeDBs, childID, sourceId);
+    return childNode ? acc.push(childNode) : acc;
+  }, List<GraphNode>());
+}
+
+export type RefTargetInfo = {
+  stack: ID[];
+  sourceId: SourceId;
+  rootNodeId?: ID;
+  scrollToId?: string;
+};
+
+export function getRefTargetInfo(
+  refId: ID,
+  knowledgeDBs: KnowledgeDBs,
+  effectiveAuthor: SourceId
+): RefTargetInfo | undefined {
+  const node = getNode(knowledgeDBs, refId, effectiveAuthor);
+  if (!node) {
+    return undefined;
+  }
+
+  const stack = getNodeStack(knowledgeDBs, node, effectiveAuthor);
+  return {
+    stack,
+    sourceId: effectiveAuthor,
+    rootNodeId: node.id,
+  };
+}
+
+export function ensureNodeNativeFields(
+  db: KnowledgeData,
+  node: GraphNode
+): GraphNode {
+  const existingNode = db.nodes.get(node.id);
+  const parent = node.parent || existingNode?.parent;
+
+  if (node.parent === parent) {
+    return node;
+  }
+
+  return {
+    ...node,
+    parent,
+  };
+}
+
+export function deleteNodes(nodes: GraphNode, indices: Set<number>): GraphNode {
+  const children = indices
+    .sortBy((index) => -index)
+    .reduce((r, deleteIndex) => r.delete(deleteIndex), nodes.children);
+  return {
+    ...nodes,
+    children,
+  };
+}
+
+export function moveNodes(
+  nodes: GraphNode,
+  indices: Array<number>,
+  startPosition: number
+): GraphNode {
+  const itemsToMove = nodes.children.filter((_, i) => indices.includes(i));
+  const itemsBeforeStartPos = indices.filter((i) => i < startPosition).length;
+  const updatedItems = nodes.children
+    .filterNot((_, i) => indices.includes(i))
+    .splice(startPosition - itemsBeforeStartPos, 0, ...itemsToMove.toArray());
+  return {
+    ...nodes,
+    children: updatedItems,
+  };
+}
+
+export function isEmptyNodeID(nodeID: ID): boolean {
+  return nodeID === EMPTY_NODE_ID;
+}
+
+export function itemPassesFilters(
+  item: GraphNode,
+  activeFilters: (Relevance | "incoming" | "contains")[]
+): boolean {
+  if (isEmptyNodeID(item.id)) {
+    return true;
+  }
+
+  const relevanceFilter =
+    item.relevance === undefined ? "contains" : item.relevance;
+  if (!activeFilters.includes(relevanceFilter)) {
+    return false;
+  }
+
+  return true;
+}
+
+type EmptyNodeData = {
+  index: number;
+  nodeItem: GraphNode;
+  paneIndex: number;
+};
+
+// Compute current empty node data from temporary events
+// Events are processed in order: ADD sets data, REMOVE clears it
+export function computeEmptyNodeMetadata(
+  temporaryEvents: List<TemporaryEvent>
+): Map<ID, EmptyNodeData> {
+  return temporaryEvents.reduce((metadata, event) => {
+    if (event.type === "ADD_EMPTY_NODE") {
+      return metadata.set(event.nodeID, {
+        index: event.index,
+        nodeItem: event.nodeItem,
+        paneIndex: event.paneIndex,
+      });
+    }
+    if (event.type === "REMOVE_EMPTY_NODE") {
+      return metadata.delete(event.nodeID);
+    }
+    return metadata;
+  }, Map<ID, EmptyNodeData>());
+}
+
+// Inject empty nodes back into nodes based on temporaryEvents
+// This is called after processEvents to add empty placeholder nodes
+export function injectEmptyNodesIntoKnowledgeDBs(
+  knowledgeDBs: KnowledgeDBs,
+  temporaryEvents: List<TemporaryEvent>,
+  myself: SourceId
+): KnowledgeDBs {
+  // Compute current metadata from event stream
+  const emptyNodeMetadata = computeEmptyNodeMetadata(temporaryEvents);
+
+  if (emptyNodeMetadata.size === 0) {
+    return knowledgeDBs;
+  }
+
+  const myDB = knowledgeDBs.get(myself);
+  if (!myDB) {
+    return knowledgeDBs;
+  }
+
+  // For each empty node, insert into the corresponding nodes with its metadata
+  const updatedNodes = emptyNodeMetadata.reduce((nodes, data, nodeID) => {
+    const existingNodeID = nodeID;
+    const existingNodes = nodes.get(existingNodeID);
+    if (!existingNodes) {
+      return nodes;
+    }
+
+    // Check if empty node is already injected (from parent MergeKnowledgeDB)
+    const alreadyHasEmpty = existingNodes.children.some(
+      (itemID) => itemID === EMPTY_NODE_ID
+    );
+    if (alreadyHasEmpty) {
+      return nodes;
+    }
+
+    // Insert empty node at the specified index with its metadata (relevance, argument)
+    const updatedItems = existingNodes.children.insert(
+      data.index,
+      EMPTY_NODE_ID
+    );
+    return nodes.set(existingNodeID, {
+      ...existingNodes,
+      children: updatedItems,
+    });
+  }, myDB.nodes);
+
+  return knowledgeDBs.set(myself, {
+    ...myDB,
+    nodes: updatedNodes,
+  });
+}

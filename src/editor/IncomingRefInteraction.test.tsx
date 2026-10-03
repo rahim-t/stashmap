@@ -1,0 +1,1137 @@
+import { cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import {
+  ALICE,
+  expectTree,
+  getPane,
+  renderApp,
+  setup,
+  type,
+  navigateToNodeViaSearch,
+} from "../utils.test";
+import { modClick } from "./Multiselect.testUtils";
+
+async function clickRow(name: string): Promise<void> {
+  const row = await screen.findByRole("treeitem", {
+    name: (accessibleName) => accessibleName.startsWith(name),
+  });
+  await userEvent.click(row);
+}
+
+async function followSourceLinkChain(): Promise<void> {
+  const first = await screen.findByRole("link", {
+    name: "Navigate to Target",
+  });
+  await userEvent.click(first);
+  const second = await screen.findByRole("link", {
+    name: "Navigate to Source",
+  });
+  await userEvent.click(second);
+}
+
+async function createAcceptedItemLevelRefOnCurrentPane(
+  relevanceKey: "!" | "?" = "!"
+): Promise<void> {
+  const sourceBitcoin = getPane(1).getByRole("treeitem", { name: "Bitcoin" });
+  const targetBitcoin = getPane(0).getByRole("treeitem", { name: "Bitcoin" });
+
+  await userEvent.keyboard("{Alt>}");
+  fireEvent.dragStart(sourceBitcoin);
+  fireEvent.dragOver(targetBitcoin, { altKey: true });
+  fireEvent.drop(targetBitcoin, { altKey: true });
+  await userEvent.keyboard("{/Alt}");
+
+  const bitcoinRows = await getPane(0).findAllByRole("treeitem", {
+    name: "Bitcoin",
+  });
+  await userEvent.click(bitcoinRows[bitcoinRows.length - 1]);
+  await userEvent.keyboard(relevanceKey);
+}
+
+async function setupItemLevelIncomingRef(
+  relevanceKey: "!" | "?" = "!"
+): Promise<void> {
+  await type("Money{Enter}{Tab}Bitcoin{Enter}{Tab}Details{Escape}");
+  await userEvent.click(await screen.findByLabelText("Create new note"));
+  await type("Crypto{Enter}{Tab}Bitcoin{Enter}{Tab}Info{Escape}");
+
+  await userEvent.click(screen.getAllByLabelText("open in split pane")[0]);
+  await navigateToNodeViaSearch(1, "Money");
+  await createAcceptedItemLevelRefOnCurrentPane(relevanceKey);
+  await userEvent.click(getPane(1).getByLabelText("Close pane"));
+
+  await expectTree(`
+Crypto
+  Bitcoin
+    Bitcoin
+    Info
+    `);
+
+  await navigateToNodeViaSearch(0, "Money");
+
+  await expectTree(`
+Money
+  Bitcoin
+    Details
+    [I] Crypto / Bitcoin ${relevanceKey}↩
+    `);
+}
+
+async function setupTwoIncomingRefs(): Promise<void> {
+  await type("Money{Enter}{Tab}Bitcoin{Enter}{Tab}Details{Escape}");
+  await userEvent.click(await screen.findByLabelText("Create new note"));
+  await type("Crypto{Enter}{Tab}Bitcoin{Enter}{Tab}Info{Escape}");
+  await userEvent.click(await screen.findByLabelText("Create new note"));
+  await type("Tech{Enter}{Tab}Bitcoin{Enter}{Tab}Stuff{Escape}");
+  await userEvent.click(screen.getAllByLabelText("open in split pane")[0]);
+  await navigateToNodeViaSearch(1, "Money");
+  await navigateToNodeViaSearch(0, "Crypto");
+  await createAcceptedItemLevelRefOnCurrentPane("!");
+  await navigateToNodeViaSearch(0, "Tech");
+  await createAcceptedItemLevelRefOnCurrentPane("!");
+  await userEvent.click(getPane(1).getByLabelText("Close pane"));
+
+  await navigateToNodeViaSearch(0, "Money");
+
+  await expectTree(`
+Money
+  Bitcoin
+    Details
+    [I] Crypto / Bitcoin !↩
+    [I] Tech / Bitcoin !↩
+    `);
+}
+
+describe("Incoming reference display", () => {
+  test("item-level cref shows as outgoing ref on target and incoming ref on source", async () => {
+    const [alice] = setup([ALICE]);
+    renderApp(alice());
+
+    await setupItemLevelIncomingRef();
+
+    await navigateToNodeViaSearch(0, "Crypto");
+    await expectTree(`
+Crypto
+  Bitcoin
+    Bitcoin
+    Info
+    `);
+
+    await navigateToNodeViaSearch(0, "Money");
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    [I] Crypto / Bitcoin !↩
+    `);
+
+    cleanup();
+    renderApp(alice());
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    [I] Crypto / Bitcoin !↩
+    `);
+  });
+
+  test("incoming ref shows outgoing cref relevance indicator", async () => {
+    const [alice] = setup([ALICE]);
+    renderApp(alice());
+
+    await setupItemLevelIncomingRef("?");
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    [I] Crypto / Bitcoin ?↩
+    `);
+
+    cleanup();
+    renderApp(alice());
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    [I] Crypto / Bitcoin ?↩
+    `);
+  });
+});
+
+describe("Incoming keyboard relevance", () => {
+  test("? accepts incoming as maybe_relevant bidirectional", async () => {
+    const [alice] = setup([ALICE]);
+    renderApp(alice());
+    await setupItemLevelIncomingRef();
+
+    await clickRow("Crypto / Bitcoin");
+    await userEvent.keyboard("?");
+
+    await expectTree(
+      `
+Money
+  Bitcoin
+    Details
+    {?} Bitcoin!↩
+    `,
+      { showGutter: true }
+    );
+
+    await navigateToNodeViaSearch(0, "Crypto");
+    await expectTree(`
+Crypto
+  Bitcoin
+    Bitcoin?↩
+    Info
+    `);
+    await navigateToNodeViaSearch(0, "Money");
+
+    cleanup();
+    renderApp(alice());
+
+    await expectTree(
+      `
+Money
+  Bitcoin
+    Details
+    {?} Bitcoin!↩
+    `,
+      { showGutter: true }
+    );
+  });
+
+  test("~ accepts incoming as little_relevant (visible by default)", async () => {
+    const [alice] = setup([ALICE]);
+    renderApp(alice());
+    await setupItemLevelIncomingRef();
+
+    await clickRow("Crypto / Bitcoin");
+    await userEvent.keyboard("~");
+
+    await expectTree(
+      `
+Money
+  Bitcoin
+    Details
+    {~} Bitcoin!↩
+    `,
+      { showGutter: true }
+    );
+
+    cleanup();
+    renderApp(alice());
+
+    await expectTree(
+      `
+Money
+  Bitcoin
+    Details
+    {~} Bitcoin!↩
+    `,
+      { showGutter: true }
+    );
+  });
+});
+
+describe("Incoming keyboard argument", () => {
+  test("+ accepts incoming and sets confirms argument", async () => {
+    const [alice] = setup([ALICE]);
+    renderApp(alice());
+    await setupItemLevelIncomingRef();
+
+    await clickRow("Crypto / Bitcoin");
+    await userEvent.keyboard("+");
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    Bitcoin!↩
+    `);
+
+    await screen.findByLabelText("Evidence for Bitcoin: Confirms");
+
+    cleanup();
+    renderApp(alice());
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    Bitcoin!↩
+    `);
+
+    await screen.findByLabelText("Evidence for Bitcoin: Confirms");
+  });
+
+  test("- accepts incoming and sets contra argument", async () => {
+    const [alice] = setup([ALICE]);
+    renderApp(alice());
+    await setupItemLevelIncomingRef();
+
+    await clickRow("Crypto / Bitcoin");
+    await userEvent.keyboard("-");
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    Bitcoin!↩
+    `);
+
+    await screen.findByLabelText("Evidence for Bitcoin: Contradicts");
+
+    cleanup();
+    renderApp(alice());
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    Bitcoin!↩
+    `);
+
+    await screen.findByLabelText("Evidence for Bitcoin: Contradicts");
+  });
+
+  test("o clears argument after + sets it", async () => {
+    const [alice] = setup([ALICE]);
+    renderApp(alice());
+    await setupItemLevelIncomingRef();
+
+    await clickRow("Crypto / Bitcoin");
+    await userEvent.keyboard("+");
+
+    await screen.findByLabelText("Evidence for Bitcoin: Confirms");
+
+    await userEvent.keyboard("o");
+
+    await screen.findAllByLabelText("Evidence for Bitcoin: No evidence type");
+
+    cleanup();
+    renderApp(alice());
+
+    await screen.findAllByLabelText("Evidence for Bitcoin: No evidence type");
+  });
+});
+
+describe("Multiselect keyboard", () => {
+  test("multiple incoming refs, ! accepts all", async () => {
+    const [alice] = setup([ALICE]);
+    renderApp(alice());
+    await setupTwoIncomingRefs();
+
+    await clickRow("Crypto / Bitcoin");
+    await userEvent.keyboard("{Shift>}j{/Shift}");
+    await userEvent.keyboard("!");
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    Bitcoin!↩
+    Bitcoin!↩
+    `);
+
+    cleanup();
+    renderApp(alice());
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    Bitcoin!↩
+    Bitcoin!↩
+    `);
+  });
+
+  test("mixed regular + incoming, ! sets relevance on both", async () => {
+    const [alice] = setup([ALICE]);
+    renderApp(alice());
+    await setupItemLevelIncomingRef();
+
+    const details = screen.getByRole("treeitem", { name: "Details" });
+    const incoming = screen.getByRole("treeitem", {
+      name: (name) => name.startsWith("Crypto / Bitcoin"),
+    });
+    modClick(details, { metaKey: true });
+    await waitFor(() =>
+      expect(details.getAttribute("data-selected")).toBe("true")
+    );
+    modClick(incoming, { metaKey: true });
+    await waitFor(() =>
+      expect(incoming.getAttribute("data-selected")).toBe("true")
+    );
+    incoming.focus();
+    await userEvent.keyboard("!");
+
+    await expectTree(
+      `
+Money
+  Bitcoin
+    {!} Details
+    {!} Bitcoin!↩
+    `,
+      { showGutter: true }
+    );
+
+    cleanup();
+    renderApp(alice());
+
+    await expectTree(
+      `
+Money
+  Bitcoin
+    {!} Details
+    {!} Bitcoin!↩
+    `,
+      { showGutter: true }
+    );
+  });
+});
+
+describe("Button clicks", () => {
+  test("clicking relevance button accepts incoming ref", async () => {
+    const [alice] = setup([ALICE]);
+    renderApp(alice());
+    await setupItemLevelIncomingRef();
+
+    await userEvent.click(
+      await screen.findByLabelText("accept Crypto / Bitcoin !↩ as relevant")
+    );
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    Bitcoin!↩
+    `);
+
+    cleanup();
+    renderApp(alice());
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    Bitcoin!↩
+    `);
+  });
+
+  test("clicking x button declines incoming ref", async () => {
+    const [alice] = setup([ALICE]);
+    renderApp(alice());
+    await setupItemLevelIncomingRef();
+
+    await userEvent.click(
+      await screen.findByLabelText("decline Crypto / Bitcoin !↩")
+    );
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    `);
+
+    await userEvent.click(
+      await screen.findByLabelText("toggle Not Relevant filter")
+    );
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    Bitcoin!↩
+    `);
+
+    cleanup();
+    renderApp(alice());
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    Bitcoin!↩
+    `);
+  });
+});
+
+describe("Evidence selector on incoming ref", () => {
+  test("clicking evidence selector accepts and sets argument", async () => {
+    const [alice] = setup([ALICE]);
+    renderApp(alice());
+    await setupItemLevelIncomingRef();
+
+    await userEvent.click(
+      await screen.findByLabelText(
+        "Evidence for Crypto / Bitcoin !↩: No evidence type"
+      )
+    );
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    Bitcoin!↩
+    `);
+
+    await screen.findByLabelText("Evidence for Bitcoin: Confirms");
+
+    cleanup();
+    renderApp(alice());
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    Bitcoin!↩
+    `);
+
+    await screen.findByLabelText("Evidence for Bitcoin: Confirms");
+  });
+});
+
+describe("Head-level incoming refs via alt-drag", () => {
+  test("alt-drag creates head-level cref, incoming ref appears on source", async () => {
+    const [alice] = setup([ALICE]);
+    renderApp(alice());
+
+    await type("Source{Enter}{Tab}Child{Escape}");
+    await userEvent.click(await screen.findByLabelText("Create new note"));
+    await type("Target{Enter}{Tab}Items{Escape}");
+
+    await expectTree(`
+Target
+  Items
+    `);
+
+    await userEvent.click(screen.getAllByLabelText("open in split pane")[0]);
+    await navigateToNodeViaSearch(1, "Source");
+
+    await userEvent.keyboard("{Alt>}");
+    const sourceItems = screen.getAllByRole("treeitem", { name: "Source" });
+    fireEvent.dragStart(sourceItems[sourceItems.length - 1]);
+    const targetItems = screen.getAllByRole("treeitem", { name: "Target" });
+    fireEvent.dragOver(targetItems[0], { altKey: true });
+    fireEvent.drop(targetItems[0], { altKey: true });
+    await userEvent.keyboard("{/Alt}");
+
+    await userEvent.click(screen.getAllByLabelText("Close pane")[0]);
+
+    await navigateToNodeViaSearch(0, "Source");
+
+    await expectTree(`
+Source
+  Child
+  [I] Target ↩
+    `);
+
+    cleanup();
+    renderApp(alice());
+
+    await navigateToNodeViaSearch(0, "Source");
+
+    await expectTree(`
+Source
+  Child
+  [I] Target ↩
+    `);
+  });
+
+  test("! on head-level incoming ref creates bidirectional", async () => {
+    const [alice] = setup([ALICE]);
+    renderApp(alice());
+
+    await type("Source{Enter}{Tab}Child{Escape}");
+    await userEvent.click(await screen.findByLabelText("Create new note"));
+    await type("Target{Enter}{Tab}Items{Escape}");
+
+    await userEvent.click(screen.getAllByLabelText("open in split pane")[0]);
+    await navigateToNodeViaSearch(1, "Source");
+
+    await userEvent.keyboard("{Alt>}");
+    const sourceItems = screen.getAllByRole("treeitem", { name: "Source" });
+    fireEvent.dragStart(sourceItems[sourceItems.length - 1]);
+    const targetItems = screen.getAllByRole("treeitem", { name: "Target" });
+    fireEvent.dragOver(targetItems[0], { altKey: true });
+    fireEvent.drop(targetItems[0], { altKey: true });
+    await userEvent.keyboard("{/Alt}");
+
+    await userEvent.click(screen.getAllByLabelText("Close pane")[0]);
+
+    await navigateToNodeViaSearch(0, "Source");
+
+    await clickRow("Target");
+    await userEvent.keyboard("!");
+
+    expect(
+      (await screen.findAllByRole("treeitem", { name: "Source" })).length
+    ).toBeGreaterThan(0);
+
+    cleanup();
+    renderApp(alice());
+
+    await navigateToNodeViaSearch(0, "Source");
+    await followSourceLinkChain();
+
+    await expectTree(`
+Source
+  Child
+  Target↩
+    `);
+  });
+
+  test("full round-trip head-level: both sides bidirectional", async () => {
+    const [alice] = setup([ALICE]);
+    renderApp(alice());
+
+    await type("Source{Enter}{Tab}Child{Escape}");
+    await userEvent.click(await screen.findByLabelText("Create new note"));
+    await type("Target{Enter}{Tab}Items{Escape}");
+
+    await userEvent.click(screen.getAllByLabelText("open in split pane")[0]);
+    await navigateToNodeViaSearch(1, "Source");
+
+    await userEvent.keyboard("{Alt>}");
+    const sourceItems = screen.getAllByRole("treeitem", { name: "Source" });
+    fireEvent.dragStart(sourceItems[sourceItems.length - 1]);
+    const targetItems = screen.getAllByRole("treeitem", { name: "Target" });
+    fireEvent.dragOver(targetItems[0], { altKey: true });
+    fireEvent.drop(targetItems[0], { altKey: true });
+    await userEvent.keyboard("{/Alt}");
+
+    await userEvent.click(screen.getAllByLabelText("Close pane")[0]);
+
+    await navigateToNodeViaSearch(0, "Source");
+
+    await clickRow("Target");
+    await userEvent.keyboard("!");
+
+    expect(
+      (await screen.findAllByRole("treeitem", { name: "Source" })).length
+    ).toBeGreaterThan(0);
+
+    await navigateToNodeViaSearch(0, "Target");
+
+    await expectTree(`
+Target
+  Source!↩
+  Items
+    `);
+
+    cleanup();
+    renderApp(alice());
+
+    await navigateToNodeViaSearch(0, "Source");
+    await followSourceLinkChain();
+
+    await expectTree(`
+Source
+  Child
+  Target↩
+    `);
+
+    await navigateToNodeViaSearch(0, "Target");
+
+    await expectTree(`
+Target
+  Source!↩
+  Items
+    `);
+  });
+});
+
+describe("Filter toggle", () => {
+  test("toggle Incoming filter off hides incoming refs, back on shows them", async () => {
+    const [alice] = setup([ALICE]);
+    renderApp(alice());
+    await setupItemLevelIncomingRef();
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    [I] Crypto / Bitcoin !↩
+    `);
+
+    await userEvent.click(
+      await screen.findByLabelText("toggle Incoming filter")
+    );
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    `);
+
+    await userEvent.click(
+      await screen.findByLabelText("toggle Incoming filter")
+    );
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    [I] Crypto / Bitcoin !↩
+    `);
+  });
+});
+
+describe("Drag and drop incoming refs", () => {
+  test("drag incoming ref onto sibling accepts it", async () => {
+    const [alice] = setup([ALICE]);
+    renderApp(alice());
+    await setupItemLevelIncomingRef();
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    [I] Crypto / Bitcoin !↩
+    `);
+
+    const source = screen.getByRole("treeitem", {
+      name: "Crypto / Bitcoin !↩",
+    });
+    const target = screen.getByRole("treeitem", { name: "Details" });
+
+    fireEvent.dragStart(source);
+    fireEvent.drop(target);
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    Bitcoin!↩
+    `);
+
+    cleanup();
+    renderApp(alice());
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    Bitcoin!↩
+    `);
+  });
+
+  test("drag multiple selected incoming refs accepts all", async () => {
+    const [alice] = setup([ALICE]);
+    renderApp(alice());
+    await setupTwoIncomingRefs();
+
+    await clickRow("Crypto / Bitcoin");
+    await userEvent.keyboard("{Shift>}j{/Shift}");
+
+    const source = screen.getByRole("treeitem", {
+      name: "Crypto / Bitcoin !↩",
+    });
+    const target = screen.getByRole("treeitem", { name: "Details" });
+
+    fireEvent.dragStart(source);
+    fireEvent.drop(target);
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    Bitcoin!↩
+    Bitcoin!↩
+    `);
+
+    cleanup();
+    renderApp(alice());
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    Bitcoin!↩
+    Bitcoin!↩
+    `);
+  });
+
+  test("drag incoming ref into another pane", async () => {
+    const [alice] = setup([ALICE]);
+    renderApp(alice());
+    await setupItemLevelIncomingRef();
+
+    await userEvent.click(screen.getAllByLabelText("open in split pane")[0]);
+    await navigateToNodeViaSearch(1, "Crypto");
+
+    const source = screen.getAllByRole("treeitem", {
+      name: "Crypto / Bitcoin !↩",
+    })[0];
+    const targetItems = screen.getAllByRole("treeitem", { name: "Bitcoin" });
+    const targetInPane1 = targetItems[targetItems.length - 1];
+
+    fireEvent.dragStart(source);
+    fireEvent.drop(targetInPane1);
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    [I] Crypto / Bitcoin !↩
+Crypto
+  Bitcoin
+  Bitcoin
+    `);
+
+    cleanup();
+    renderApp(alice());
+
+    await navigateToNodeViaSearch(0, "Money");
+    await navigateToNodeViaSearch(1, "Crypto");
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    [I] Crypto / Bitcoin !↩
+Crypto
+  Bitcoin
+  Bitcoin
+    `);
+  });
+
+  test("mixed drag: regular node + incoming ref keeps the direct target node", async () => {
+    const [alice] = setup([ALICE]);
+    renderApp(alice());
+    await setupItemLevelIncomingRef();
+
+    await clickRow("Details");
+    await userEvent.keyboard("{Shift>}j{/Shift}");
+
+    const source = screen.getByRole("treeitem", { name: "Details" });
+    const target = screen.getByRole("treeitem", { name: "Money" });
+
+    fireEvent.dragStart(source);
+    fireEvent.drop(target);
+
+    await expectTree(`
+Money
+  Details
+  Bitcoin
+  Bitcoin
+    [I] Crypto / Bitcoin !↩
+    `);
+
+    cleanup();
+    renderApp(alice());
+
+    await expectTree(`
+Money
+  Details
+  Bitcoin
+  Bitcoin
+    [I] Crypto / Bitcoin !↩
+    `);
+  });
+});
+
+describe("Item-level bidirectional", () => {
+  test("! on item-level incoming ref creates bidirectional", async () => {
+    const [alice] = setup([ALICE]);
+    renderApp(alice());
+    await setupItemLevelIncomingRef();
+
+    await clickRow("Crypto / Bitcoin");
+    await userEvent.keyboard("!");
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    Bitcoin!↩
+    `);
+
+    cleanup();
+    renderApp(alice());
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    Bitcoin!↩
+    `);
+  });
+
+  test("x on item-level incoming ref hides it, toggle shows as incoming", async () => {
+    const [alice] = setup([ALICE]);
+    renderApp(alice());
+    await setupItemLevelIncomingRef();
+
+    await clickRow("Crypto / Bitcoin");
+    await userEvent.keyboard("x");
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    `);
+
+    await userEvent.click(
+      await screen.findByLabelText("toggle Not Relevant filter")
+    );
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    Bitcoin!↩
+    `);
+
+    cleanup();
+    renderApp(alice());
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    Bitcoin!↩
+    `);
+  });
+
+  test("not_relevant on either side keeps the exact reciprocal pair", async () => {
+    const [alice] = setup([ALICE]);
+    renderApp(alice());
+    await setupItemLevelIncomingRef();
+
+    await clickRow("Crypto / Bitcoin");
+    await userEvent.keyboard("!");
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    Bitcoin!↩
+    `);
+
+    await navigateToNodeViaSearch(0, "Crypto");
+
+    await expectTree(`
+Crypto
+  Bitcoin
+    Bitcoin!↩
+    Info
+    `);
+
+    const bitcoinRows = await screen.findAllByRole("treeitem", {
+      name: "Bitcoin",
+    });
+    await userEvent.click(bitcoinRows[bitcoinRows.length - 1]);
+    await userEvent.keyboard("x");
+
+    await expectTree(`
+Crypto
+  Bitcoin
+    Info
+    `);
+
+    await navigateToNodeViaSearch(0, "Money");
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    Bitcoin↩
+    `);
+
+    cleanup();
+    renderApp(alice());
+
+    await navigateToNodeViaSearch(0, "Money");
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    Bitcoin↩
+    `);
+  });
+
+  test("full round-trip: both sides show bidirectional", async () => {
+    const [alice] = setup([ALICE]);
+    renderApp(alice());
+    await setupItemLevelIncomingRef();
+
+    await clickRow("Crypto / Bitcoin");
+    await userEvent.keyboard("!");
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    Bitcoin!↩
+    `);
+
+    await navigateToNodeViaSearch(0, "Crypto");
+
+    await expectTree(`
+Crypto
+  Bitcoin
+    Bitcoin!↩
+    Info
+    `);
+
+    cleanup();
+    renderApp(alice());
+
+    await navigateToNodeViaSearch(0, "Money");
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    Bitcoin!↩
+    `);
+
+    await navigateToNodeViaSearch(0, "Crypto");
+
+    await expectTree(`
+Crypto
+  Bitcoin
+    Bitcoin!↩
+    Info
+    `);
+  });
+});
+
+describe("Multi-user incoming refs", () => {});
+
+describe("Tombstone / deleted ref interactions", () => {
+  test("accept incoming ref then delete source shows dead-link furniture", async () => {
+    const [alice] = setup([ALICE]);
+    renderApp(alice());
+    await setupItemLevelIncomingRef();
+
+    await clickRow("Crypto / Bitcoin");
+    await userEvent.keyboard("!");
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    Bitcoin!↩
+    `);
+
+    await navigateToNodeViaSearch(0, "Crypto");
+
+    await expectTree(`
+Crypto
+  Bitcoin
+    Bitcoin!↩
+    Info
+    `);
+
+    await userEvent.click(await screen.findByLabelText("edit Crypto"));
+    await userEvent.keyboard("{Escape}{Delete}");
+
+    await navigateToNodeViaSearch(0, "Money");
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    Bitcoin†
+    `);
+
+    cleanup();
+    renderApp(alice());
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    Bitcoin†
+    `);
+  });
+
+  test("delete source of incoming ref, incoming ref disappears", async () => {
+    const [alice] = setup([ALICE]);
+    renderApp(alice());
+    await setupItemLevelIncomingRef();
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    [I] Crypto / Bitcoin !↩
+    `);
+
+    await navigateToNodeViaSearch(0, "Crypto");
+
+    await userEvent.click(await screen.findByLabelText("edit Crypto"));
+    await userEvent.keyboard("{Escape}{Delete}");
+
+    await navigateToNodeViaSearch(0, "Money");
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    `);
+
+    cleanup();
+    renderApp(alice());
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    `);
+  });
+
+  test("bidirectional deletion leaves dead-link furniture", async () => {
+    const [alice] = setup([ALICE]);
+    renderApp(alice());
+    await setupItemLevelIncomingRef();
+
+    await clickRow("Crypto / Bitcoin");
+    await userEvent.keyboard("!");
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    Bitcoin!↩
+    `);
+
+    await navigateToNodeViaSearch(0, "Crypto");
+
+    await expectTree(`
+Crypto
+  Bitcoin
+    Bitcoin!↩
+    Info
+    `);
+
+    await userEvent.click(await screen.findByLabelText("edit Crypto"));
+    await userEvent.keyboard("{Escape}{Delete}");
+
+    await navigateToNodeViaSearch(0, "Money");
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    Bitcoin†
+    `);
+
+    cleanup();
+    renderApp(alice());
+
+    await expectTree(`
+Money
+  Bitcoin
+    Details
+    Bitcoin†
+    `);
+  });
+});

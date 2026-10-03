@@ -1,35 +1,22 @@
 import fs from "fs";
 import path from "path";
-import { decodePublicKeyInputSync } from "../nostrPublicKeys";
-import { sanitizeRelays } from "../relayUtils";
-
-type RawRelay =
-  | string
-  | {
-      url: string;
-      read?: boolean;
-      write?: boolean;
-    };
-
-type RawProfile = {
-  pubkey?: string;
-  read_as?: string;
-  workspace_dir?: string;
-  nsec_file?: string;
-  bootstrap_relays?: string[];
-  relays?: RawRelay[];
-};
+import { generateSecretKey, getPublicKey, nip19 } from "nostr-tools";
+import { hexToBytes } from "@noble/hashes/utils";
+import { convertInputToPrivateKey } from "../nostrKey";
+import { decodePublicKeyInputSync } from "../infra/nostr/publicKeys";
+import {
+  WorkspaceConfig,
+  filesystemProfileFromWorkspaceConfig,
+  normalizeWorkspaceConfig,
+  parseFilesystemProfile,
+} from "../workspaceConfig";
 
 export type LoadedCliProfile = {
-  pubkey: PublicKey;
-  readAs: PublicKey;
+  workspaceConfig: WorkspaceConfig;
   workspaceDir: string;
-  bootstrapRelays: Relays;
-  relays: Relays;
-  nsecFile?: string;
+  pubkey: PublicKey | undefined;
+  nsecFile: string | undefined;
   configPath: string;
-  knowstrHome: string;
-  agentRoot: string;
 };
 
 function resolveAbsolute(baseDir: string, value: string): string {
@@ -48,52 +35,66 @@ function getAgentRoot(profilePath: string): string {
     : profileDir;
 }
 
-function parseRelayList(
-  relays: RawRelay[] | undefined,
-  source: string
-): Relays {
-  const normalized = (relays || []).map((relay) =>
-    typeof relay === "string"
-      ? { url: relay, read: true, write: true }
-      : {
-          url: relay.url,
-          read: relay.read ?? true,
-          write: relay.write ?? true,
-        }
+function loadPubkey(nsecPath: string): PublicKey {
+  if (!fs.existsSync(nsecPath)) {
+    throw new Error(`Missing private key: ${nsecPath}`);
+  }
+  const privateKey = convertInputToPrivateKey(
+    fs.readFileSync(nsecPath, "utf8")
   );
-  const sanitized = sanitizeRelays(normalized);
-  if (sanitized.length !== normalized.length) {
-    throw new Error(`Invalid relay URL in ${source}`);
+  if (!privateKey) {
+    throw new Error(`Invalid private key in ${nsecPath}`);
   }
-  return sanitized;
+  const pubkey = decodePublicKeyInputSync(getPublicKey(hexToBytes(privateKey)));
+  if (!pubkey) {
+    throw new Error(`Invalid derived public key for ${nsecPath}`);
+  }
+  return pubkey;
 }
 
-function parseBootstrapRelays(
-  relays: string[] | undefined,
-  source: string
-): Relays {
-  const normalized = (relays || []).map((url) => ({
-    url,
-    read: true,
-    write: true,
-  }));
-  const sanitized = sanitizeRelays(normalized);
-  if (sanitized.length !== normalized.length) {
-    throw new Error(`Invalid relay URL in ${source}`);
-  }
-  return sanitized;
+export function writeJsonFile(filePath: string, value: unknown): void {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const temporaryPath = `${filePath}.${process.pid}.tmp`;
+  fs.writeFileSync(temporaryPath, `${JSON.stringify(value, null, 2)}\n`);
+  fs.renameSync(temporaryPath, filePath);
 }
 
-function parsePubkey(value: string | undefined): PublicKey {
-  const decoded = decodePublicKeyInputSync(value);
-  if (!decoded) {
-    throw new Error(
-      "profile.json must include a valid pubkey (hex, npub, or nprofile)"
-    );
+export function writeCliWorkspaceConfig(
+  workspaceDir: string,
+  config: WorkspaceConfig
+): void {
+  const normalized = normalizeWorkspaceConfig(config);
+  if (normalized.storageRelays.length > 0) {
+    throw new Error("Filesystem workspaces cannot configure storage relays");
   }
-  return decoded;
-}
+  const knowstrDir = path.join(workspaceDir, ".knowstr");
+  const profilePath = path.join(knowstrDir, "profile.json");
+  if (normalized.roomRelays.length === 0) {
+    if (fs.existsSync(profilePath)) {
+      fs.unlinkSync(profilePath);
+    }
+    return;
+  }
 
+  const existing = fs.existsSync(profilePath)
+    ? parseFilesystemProfile(JSON.parse(fs.readFileSync(profilePath, "utf8")))
+        .profile
+    : undefined;
+  const relativeNsecFile = existing?.nsec_file ?? "./.knowstr/me.nsec";
+  const nsecPath = resolveAbsolute(workspaceDir, relativeNsecFile);
+  fs.mkdirSync(path.dirname(nsecPath), { recursive: true });
+  if (!fs.existsSync(nsecPath)) {
+    fs.writeFileSync(nsecPath, `${nip19.nsecEncode(generateSecretKey())}\n`, {
+      mode: 0o600,
+    });
+  }
+  loadPubkey(nsecPath);
+
+  writeJsonFile(
+    profilePath,
+    filesystemProfileFromWorkspaceConfig(normalized, relativeNsecFile)
+  );
+}
 export function loadCliProfile({
   cwd = process.cwd(),
   env = process.env,
@@ -106,34 +107,32 @@ export function loadCliProfile({
   const resolvedConfigPath = configPath
     ? resolveAbsolute(cwd, configPath)
     : path.join(resolveKnowstrHome(cwd, env), "profile.json");
-  const agentRoot = getAgentRoot(resolvedConfigPath);
-  const knowstrHome = env.KNOWSTR_HOME
-    ? resolveKnowstrHome(cwd, env)
-    : path.join(agentRoot, ".knowstr");
+  const workspaceDir = getAgentRoot(resolvedConfigPath);
 
   if (!fs.existsSync(resolvedConfigPath)) {
-    throw new Error(`Missing Knowstr profile: ${resolvedConfigPath}`);
+    return {
+      workspaceConfig: { storageRelays: [], roomRelays: [] },
+      workspaceDir,
+      pubkey: undefined,
+      nsecFile: undefined,
+      configPath: resolvedConfigPath,
+    };
   }
 
-  const raw = fs.readFileSync(resolvedConfigPath, "utf8");
-  const profile = JSON.parse(raw) as RawProfile;
+  const parsed = parseFilesystemProfile(
+    JSON.parse(fs.readFileSync(resolvedConfigPath, "utf8"))
+  );
+  const resolvedNsecFile = resolveAbsolute(
+    workspaceDir,
+    parsed.profile.nsec_file
+  );
+  const pubkey = loadPubkey(resolvedNsecFile);
 
   return {
-    pubkey: parsePubkey(profile.pubkey),
-    readAs: parsePubkey(profile.read_as || profile.pubkey),
-    workspaceDir: resolveAbsolute(agentRoot, profile.workspace_dir || "."),
-    bootstrapRelays: parseBootstrapRelays(
-      profile.bootstrap_relays,
-      `${resolvedConfigPath}#bootstrap_relays`
-    ),
-    relays: parseRelayList(profile.relays, `${resolvedConfigPath}#relays`),
-    ...(profile.nsec_file
-      ? {
-          nsecFile: resolveAbsolute(agentRoot, profile.nsec_file),
-        }
-      : {}),
+    workspaceConfig: parsed.config,
+    workspaceDir,
+    pubkey,
+    nsecFile: resolvedNsecFile,
     configPath: resolvedConfigPath,
-    knowstrHome,
-    agentRoot,
   };
 }

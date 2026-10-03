@@ -1,444 +1,192 @@
-import { List } from "immutable";
+import { List, Set } from "immutable";
+import { nodeText } from "./core/nodeSpans";
+import { getDocumentForNode } from "./core/Document";
+import { isCanonicalId } from "./core/entityRecognition";
+import { fileLinkIndexKey } from "./core/linkPath";
+import { nodeRefKey } from "./core/nodeRef";
+import { referenceToText } from "./editor/referenceText";
 import {
-  getChildNodes,
-  getNode,
-  resolveNode,
-  isRefNode,
-  shortID,
-  splitID,
-  itemPassesFilters,
-  getSemanticID,
-  getNodeContext,
-} from "./connections";
-import { getTextForSemanticID } from "./semanticProjection";
-import {
-  ViewPath,
-  getParentView,
-  getLast,
-  getNodeForView,
-} from "./ViewContext";
-import { getPane } from "./planner";
-import { DEFAULT_TYPE_FILTERS } from "./constants";
-import { referenceToText } from "./components/referenceDisplay";
-
-function argumentPrefix(argument?: Argument): string {
-  if (argument === "confirms") {
-    return "+";
-  }
-  if (argument === "contra") {
-    return "-";
-  }
-  return "";
-}
-
-function resolveNodeLabel(
-  knowledgeDBs: KnowledgeDBs,
-  myself: PublicKey,
-  nodeId: ID
-): string {
-  return getTextForSemanticID(knowledgeDBs, nodeId, myself) || "Loading...";
-}
-
-function resolveContextLabels(
-  knowledgeDBs: KnowledgeDBs,
-  myself: PublicKey,
-  context: List<ID>
-): string[] {
-  return context
-    .map((nodeId) => resolveNodeLabel(knowledgeDBs, myself, nodeId))
-    .toArray();
-}
+  ResolvedNode,
+  getNodeInSource,
+  graphLookupFromData,
+  linkSpeaker,
+  lookupNode,
+} from "./core/graphLookup";
 
 type ParsedRef = {
   node: GraphNode;
-  nodeContext: List<ID>;
-  sourceItem?: GraphNode;
+  nodeSourceId: SourceId;
+  contextNodes: List<GraphNode>;
 };
 
+function getConcreteContextNodes(
+  graph: ReturnType<typeof graphLookupFromData>,
+  node: GraphNode,
+  sourceId: SourceId
+): List<GraphNode> {
+  const loop = (
+    currentParentID: ID | undefined,
+    visited: Set<string>,
+    nodes: List<GraphNode>
+  ): List<GraphNode> => {
+    if (!currentParentID) return nodes;
+    const parentKey = `${sourceId}:${currentParentID}`;
+    if (visited.has(parentKey)) return nodes;
+    const parentNode = getNodeInSource(graph, {
+      sourceId,
+      id: currentParentID,
+    })?.node;
+    return parentNode
+      ? loop(
+          parentNode.parent,
+          visited.add(parentKey),
+          nodes.unshift(parentNode)
+        )
+      : nodes;
+  };
+
+  return loop(node.parent, Set([`${sourceId}:${node.id}`]), List());
+}
+
 function parseRef(
-  refId: LongID,
-  knowledgeDBs: KnowledgeDBs,
-  myself: PublicKey
+  graph: ReturnType<typeof graphLookupFromData>,
+  refId: ID,
+  sourceId: SourceId
 ): ParsedRef | undefined {
-  const sourceItem = getNode(knowledgeDBs, refId, myself);
-  const node = resolveNode(knowledgeDBs, sourceItem);
-  if (!node) {
-    return undefined;
-  }
-
-  const nodeContext = getNodeContext(knowledgeDBs, node).map(
-    (id) => shortID(id) as ID
-  );
-
-  return { node, nodeContext, sourceItem: sourceItem || node };
+  const source = lookupNode(graph, refId, sourceId);
+  return source
+    ? {
+        node: source.node,
+        nodeSourceId: source.ref.sourceId,
+        contextNodes: getConcreteContextNodes(
+          graph,
+          source.node,
+          source.ref.sourceId
+        ),
+      }
+    : undefined;
 }
 
-function resolveLabels(
-  knowledgeDBs: KnowledgeDBs,
-  myself: PublicKey,
-  node: GraphNode,
-  nodeContext: List<ID>
-): { contextLabels: string[]; targetLabel: string; fullContext: List<ID> } {
-  const contextLabels = resolveContextLabels(knowledgeDBs, myself, nodeContext);
-  const targetLabel = resolveNodeLabel(
-    knowledgeDBs,
-    myself,
-    getSemanticID(knowledgeDBs, node)
-  );
-  return { contextLabels, targetLabel, fullContext: nodeContext };
-}
-
-function nodesMatchForVersion(
-  knowledgeDBs: KnowledgeDBs,
-  left: GraphNode,
-  right: GraphNode
-): boolean {
-  return (
-    getSemanticID(knowledgeDBs, left) === getSemanticID(knowledgeDBs, right) &&
-    getNodeContext(knowledgeDBs, left).equals(
-      getNodeContext(knowledgeDBs, right)
-    )
-  );
-}
-
-function buildDeletedReference(
-  refId: LongID,
-  myself: PublicKey,
-  linkText?: string
-): ReferenceRow | undefined {
-  const [remote] = splitID(refId);
-  const author = remote || myself;
-
-  if (!linkText) return undefined;
-
-  const parts = linkText.split(" / ");
-  const targetLabel = parts[parts.length - 1];
-  const contextLabels = parts.slice(0, -1);
-  return {
-    id: refId,
-    type: "reference",
-    text: `(deleted) ${linkText}`,
-    targetContext: List<ID>(),
-    contextLabels,
-    targetLabel,
-    author,
-    deleted: true,
-  };
-}
-
-export function buildOutgoingReference(
-  refId: LongID,
-  knowledgeDBs: KnowledgeDBs,
-  myself: PublicKey
-): ReferenceRow | undefined {
-  const ref = parseRef(refId, knowledgeDBs, myself);
-  if (!ref) return buildDeletedReference(refId, myself);
-
-  const { contextLabels, targetLabel, fullContext } = resolveLabels(
-    knowledgeDBs,
-    myself,
-    ref.node,
-    ref.nodeContext
-  );
-  const contextPath = contextLabels.join(" / ");
-  const text = contextPath ? `${contextPath} / ${targetLabel}` : targetLabel;
-
-  return {
-    id: refId,
-    type: "reference",
-    text,
-    targetContext: fullContext,
-    contextLabels,
-    targetLabel,
-    author: ref.node.author,
-  };
-}
-
-function effectiveIDs(
-  knowledgeDBs: KnowledgeDBs,
-  node: GraphNode,
-  activeFilters: (
-    | Relevance
-    | "suggestions"
-    | "versions"
-    | "incoming"
-    | "contains"
-  )[]
-): List<string> {
-  return getChildNodes(knowledgeDBs, node, node.author)
+function buildReference(
+  refId: ID,
+  ref: ParsedRef
+): NonNullable<Row["reference"]> {
+  const targetLabel = nodeText(ref.node);
+  const contextLabels = ref.contextNodes
+    .map((node) => nodeText(node))
+    .toArray()
     .filter(
-      (item) =>
-        itemPassesFilters(item, activeFilters) &&
-        item.relevance !== "not_relevant"
-    )
-    .map((item) => getSemanticID(knowledgeDBs, item))
-    .toList();
-}
-
-function computeNodeDiff(
-  knowledgeDBs: KnowledgeDBs,
-  versionNode: GraphNode,
-  parentNode: GraphNode | undefined,
-  activeFilters: (
-    | Relevance
-    | "suggestions"
-    | "versions"
-    | "incoming"
-    | "contains"
-  )[]
-): { addCount: number; removeCount: number } {
-  const versionIDs = effectiveIDs(
-    knowledgeDBs,
-    versionNode,
-    activeFilters
-  ).toSet();
-  const parentIDs = parentNode
-    ? effectiveIDs(knowledgeDBs, parentNode, activeFilters).toSet()
-    : List<string>().toSet();
+      (label, index, labels) =>
+        label !== targetLabel || index !== labels.length - 1
+    );
   return {
-    addCount: versionIDs.filter((id) => !parentIDs.has(id)).size,
-    removeCount: parentIDs.filter((id) => !versionIDs.has(id)).size,
+    id: refId,
+    text: [...contextLabels, targetLabel].join(" / "),
+    contextLabels,
+    targetLabel,
+    sourceId: ref.nodeSourceId,
   };
 }
 
-function computeVersionMeta(
-  data: Data,
-  viewPath: ViewPath,
-  stack: ID[]
-): VersionMeta {
-  const refId = getLast(viewPath);
-  const node = resolveNode(
-    data.knowledgeDBs,
-    getNode(data.knowledgeDBs, refId, data.user.publicKey)
+function sameRef(left: NodeRef, right: NodeRef): boolean {
+  return left.id === right.id && left.sourceId === right.sourceId;
+}
+
+function uniqueRefs(refs: readonly NodeRef[]): NodeRef[] {
+  return refs.reduce<NodeRef[]>(
+    (acc, ref) =>
+      acc.some((candidate) => sameRef(candidate, ref)) ? acc : [...acc, ref],
+    []
   );
-  if (!node) return { updated: 0, addCount: 0, removeCount: 0 };
+}
 
-  const pane = getPane(data, viewPath);
-  const activeFilters = pane.typeFilters || DEFAULT_TYPE_FILTERS;
+function incomingGraphRefs(data: Data, target: ResolvedNode): NodeRef[] {
+  const exact =
+    data.graphIndex.incomingCrefsByTarget.get(nodeRefKey(target.ref)) ?? [];
+  const unscoped = data.graphIndex.incomingCrefs.get(target.node.id) ?? [];
+  if (isCanonicalId(target.node.id)) {
+    return uniqueRefs([...exact, ...unscoped]);
+  }
+  if (exact.length > 0) {
+    return exact;
+  }
+  return unscoped;
+}
 
-  const parentPath = getParentView(viewPath);
-  const parentNode = parentPath
-    ? getNodeForView(data, parentPath, stack)
-    : undefined;
-
-  const { addCount, removeCount } = computeNodeDiff(
+function incomingFileRefs(data: Data, target: ResolvedNode): NodeRef[] {
+  const document = getDocumentForNode(
     data.knowledgeDBs,
-    node,
-    parentNode,
-    activeFilters
+    data.documents,
+    target.node,
+    target.ref.sourceId
   );
-  return { updated: node.updated, addCount, removeCount };
+  return document?.filePath && document.topNodeShortIds[0] === target.node.id
+    ? data.graphIndex.incomingFileLinks.get(
+        fileLinkIndexKey(document.sourceId, document.filePath)
+      ) ?? []
+    : [];
 }
 
-function findCrefToNode(
-  children: List<ID>,
-  targetNode: GraphNode,
-  knowledgeDBs: KnowledgeDBs,
-  myself: PublicKey
-): GraphNode | undefined {
-  return children
-    .map((childID) => getNode(knowledgeDBs, childID, myself))
-    .find((item) => {
-      if (!isRefNode(item)) return false;
-      const resolvedTarget = resolveNode(knowledgeDBs, item);
-      return resolvedTarget?.id === targetNode.id;
-    });
-}
-
-function getReferenceSourceNodes(
-  ref: ParsedRef,
-  knowledgeDBs: KnowledgeDBs
-): GraphNode[] {
-  const parentNode = ref.node.parent
-    ? getNode(knowledgeDBs, ref.node.parent, ref.node.author)
-    : undefined;
-  return parentNode && parentNode.id !== ref.node.id
-    ? [ref.node, parentNode]
-    : [ref.node];
-}
-
-function findIncomingCrefItem(
-  ref: ParsedRef,
+function findIncomingLinkItem(
+  graph: ReturnType<typeof graphLookupFromData>,
   data: Data,
-  viewPath: ViewPath,
-  stack: ID[]
+  source: NodeRef,
+  target: ResolvedNode | undefined
 ): GraphNode | undefined {
-  const parentPath = getParentView(viewPath);
-  if (!parentPath) return undefined;
-  const parentNode = getNodeForView(data, parentPath, stack);
-  if (!parentNode) return undefined;
-  return getReferenceSourceNodes(ref, data.knowledgeDBs)
-    .map((sourceNode) =>
-      findCrefToNode(
-        sourceNode.children,
-        parentNode,
-        data.knowledgeDBs,
-        data.user.publicKey
-      )
-    )
-    .find((item) => item !== undefined);
+  if (!target) return undefined;
+  return [...incomingGraphRefs(data, target), ...incomingFileRefs(data, target)]
+    .map((candidate) => getNodeInSource(graph, candidate))
+    .filter((candidate): candidate is ResolvedNode => candidate !== undefined)
+    .find((candidate) => sameRef(linkSpeaker(graph, candidate).ref, source))
+    ?.node;
+}
+
+export function findReciprocalLinkItem(
+  graph: ReturnType<typeof graphLookupFromData>,
+  data: Data,
+  sourceOccurrence: ResolvedNode,
+  target: ResolvedNode
+): GraphNode | undefined {
+  const source = linkSpeaker(graph, sourceOccurrence);
+  const refs = [
+    ...incomingGraphRefs(data, source),
+    ...incomingFileRefs(data, source),
+  ];
+  return refs
+    .filter((candidate) => !sameRef(candidate, sourceOccurrence.ref))
+    .map((candidate) => getNodeInSource(graph, candidate))
+    .filter((candidate): candidate is ResolvedNode => candidate !== undefined)
+    .find((candidate) => sameRef(linkSpeaker(graph, candidate).ref, target.ref))
+    ?.node;
 }
 
 export function buildReferenceItem(
-  refId: LongID,
+  graph: ReturnType<typeof graphLookupFromData>,
+  refId: ID,
   data: Data,
-  viewPath: ViewPath,
-  stack: ID[],
-  virtualType?: VirtualType,
-  versionMeta?: VersionMeta
-): ReferenceRow | undefined {
-  const ref = parseRef(refId, data.knowledgeDBs, data.user.publicKey);
-  if (!ref) {
-    const parentPath = getParentView(viewPath);
-    const parentNode = parentPath
-      ? getNodeForView(data, parentPath, stack)
-      : undefined;
-    const parentItem = parentNode
-      ? getNode(data.knowledgeDBs, refId, data.user.publicKey)
-      : undefined;
-    return buildDeletedReference(
-      refId,
-      data.user.publicKey,
-      parentItem?.linkText
-    );
-  }
-
-  if (virtualType === "suggestion") {
-    const outgoing = buildOutgoingReference(
-      refId,
-      data.knowledgeDBs,
-      data.user.publicKey
-    );
-    if (!outgoing) return undefined;
-    return { ...outgoing, text: outgoing.targetLabel };
-  }
-
-  if (virtualType === "incoming") {
-    const outgoing = buildOutgoingReference(
-      refId,
-      data.knowledgeDBs,
-      data.user.publicKey
-    );
-    if (!outgoing) return undefined;
-    const crefItem =
-      virtualType === "incoming"
-        ? findIncomingCrefItem(ref, data, viewPath, stack)
-        : undefined;
-    const incomingRelevance = crefItem?.relevance ?? ref.sourceItem?.relevance;
-    const incomingArgument = crefItem?.argument ?? ref.sourceItem?.argument;
-    const text = referenceToText({
+  sourceId: SourceId,
+  virtualType: Row["virtualType"],
+  containing: ResolvedNode | undefined
+): Row["reference"] {
+  if (virtualType !== "incoming") return undefined;
+  const parsed = parseRef(graph, refId, sourceId);
+  if (!parsed) return undefined;
+  const outgoing = buildReference(refId, parsed);
+  const sourceRef = { sourceId: parsed.nodeSourceId, id: parsed.node.id };
+  const incoming = findIncomingLinkItem(graph, data, sourceRef, containing);
+  const incomingRelevance = incoming?.relevance ?? parsed.node.relevance;
+  const incomingArgument = incoming?.argument ?? parsed.node.argument;
+  return {
+    ...outgoing,
+    text: referenceToText({
       displayAs: "incoming",
       contextLabels: outgoing.contextLabels,
       targetLabel: outgoing.targetLabel,
       incomingRelevance,
       incomingArgument,
-    });
-    return {
-      ...outgoing,
-      text,
-      displayAs: "incoming",
-      incomingRelevance,
-      incomingArgument,
-    };
-  }
-
-  if (virtualType === "version" && versionMeta) {
-    const outgoing = buildOutgoingReference(
-      refId,
-      data.knowledgeDBs,
-      data.user.publicKey
-    );
-    if (!outgoing) return undefined;
-    const isOtherUser = outgoing.author !== data.user.publicKey;
-    const dateStr = new Date(versionMeta.updated).toLocaleString();
-    const parts = [
-      dateStr,
-      ...(isOtherUser ? ["\u{1F464}"] : []),
-      ...(versionMeta.addCount > 0 ? [`+${versionMeta.addCount}`] : []),
-      ...(versionMeta.removeCount > 0 ? [`-${versionMeta.removeCount}`] : []),
-    ];
-    const text = parts.join(" ");
-    return { ...outgoing, text, versionMeta };
-  }
-
-  const outgoing = buildOutgoingReference(
-    refId,
-    data.knowledgeDBs,
-    data.user.publicKey
-  );
-  if (!outgoing || !ref) return outgoing;
-
-  const parentPath = getParentView(viewPath);
-  if (!parentPath) return outgoing;
-
-  const parentNode = getNodeForView(data, parentPath, stack);
-  if (
-    parentNode &&
-    nodesMatchForVersion(data.knowledgeDBs, ref.node, parentNode)
-  ) {
-    const computedVersionMeta = computeVersionMeta(data, viewPath, stack);
-    return {
-      ...outgoing,
-      text: outgoing.text,
-      versionMeta: computedVersionMeta,
-    };
-  }
-  if (!parentNode) return outgoing;
-
-  const storedItem = getNode(data.knowledgeDBs, refId, data.user.publicKey);
-  const isNotRelevant = storedItem?.relevance === "not_relevant";
-
-  const findReverseCref = (children: List<ID>): GraphNode | undefined =>
-    findCrefToNode(
-      children,
-      parentNode,
-      data.knowledgeDBs,
-      data.user.publicKey
-    );
-
-  const incomingCref = getReferenceSourceNodes(ref, data.knowledgeDBs)
-    .map((sourceNode) => findReverseCref(sourceNode.children))
-    .find((item) => item !== undefined);
-  const hasActiveIncoming =
-    !!incomingCref && incomingCref.relevance !== "not_relevant";
-
-  const displayAs = (() => {
-    if (!hasActiveIncoming) return undefined;
-    return isNotRelevant ? "incoming" : "bidirectional";
-  })();
-
-  if (!displayAs) {
-    const argument = argumentPrefix(
-      storedItem?.argument ?? ref.sourceItem?.argument
-    );
-    if (!argument) {
-      return outgoing;
-    }
-    const targetLabel = `${argument} ${outgoing.targetLabel}`;
-    return {
-      ...outgoing,
-      targetLabel,
-      text: referenceToText({
-        contextLabels: outgoing.contextLabels,
-        targetLabel,
-      }),
-    };
-  }
-
-  const incomingRel = incomingCref!.relevance;
-  const incomingArg = incomingCref!.argument;
-  const text = referenceToText({
-    displayAs,
-    contextLabels: outgoing.contextLabels,
-    targetLabel: outgoing.targetLabel,
-    incomingRelevance: incomingRel,
-    incomingArgument: incomingArg,
-  });
-  return {
-    ...outgoing,
-    text,
-    displayAs,
-    incomingRelevance: incomingRel,
-    incomingArgument: incomingArg,
+    }),
+    displayAs: "incoming",
+    incomingRelevance,
+    incomingArgument,
   };
 }

@@ -1,9 +1,10 @@
 import React, { useEffect } from "react";
 import { Navigate, Route, Routes } from "react-router-dom";
-import Dashboard from "./components/Dashboard";
-import { RelaysWrapper } from "./components/Relays";
+import Dashboard from "./editor/Dashboard";
+import { RelaysWrapper } from "./editor/Relays";
 import { SignUp } from "./SignUp";
 import { SignInModal } from "./SignIn";
+import { EntityLabelProvider } from "./EntityLabelContext";
 
 export function App(): JSX.Element {
   useEffect(() => {
@@ -37,15 +38,19 @@ export function App(): JSX.Element {
   }, []);
 
   return (
-    <Routes>
-      <Route path="/" element={<Dashboard />}>
-        <Route path="follow" element={<Navigate replace to="/" />} />
-        <Route path="relays" element={<RelaysWrapper />} />
-        <Route path="signin" element={<SignInModal />} />
-        <Route path="signup" element={<SignUp />} />
-      </Route>
-      <Route path="/n/*" element={<Dashboard />} />
-      <Route path="/r/:nodeId" element={<Dashboard />} />
-    </Routes>
+    <EntityLabelProvider>
+      <Routes>
+        <Route path="/" element={<Dashboard />}>
+          <Route path="follow" element={<Navigate replace to="/" />} />
+          <Route path="relays" element={<RelaysWrapper />} />
+          <Route path="signin" element={<SignInModal />} />
+          <Route path="signup" element={<SignUp />} />
+        </Route>
+        <Route path="/local/d/:docId" element={<Dashboard />} />
+        <Route path="/local/n/:nodeId" element={<Dashboard />} />
+        <Route path="/storage/:naddr" element={<Dashboard />} />
+        <Route path="/deposit/:naddr" element={<Dashboard />} />
+      </Routes>
+    </EntityLabelProvider>
   );
 }

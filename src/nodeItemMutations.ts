@@ -1,122 +1,144 @@
-import {
-  createRefTarget,
-  isEmptySemanticID,
-  getNode,
-  isRefNode,
-} from "./connections";
+import { LOCAL } from "./core/nodeRef";
+import { isEmptyNodeID, getNode } from "./core/connections";
+import { spansText, spansToMarkdown } from "./core/nodeSpans";
 import { planUpdateNodeItemMetadataById } from "./dataPlanner";
-import { NodeItemMetadata } from "./nodeItemMetadata";
-import {
-  getParentView,
-  getNodeForView,
-  getNodeIndexForView,
-  getRowIDFromView,
-  viewPathToString,
-  ViewPath,
-  VirtualRowsMap,
-} from "./ViewContext";
+import { NodeItemMetadata, updateNodeItemMetadata } from "./nodeItemMetadata";
+import { ViewPath } from "./rowModel";
 import {
   Plan,
-  planAddToParent,
-  planDeepCopyNode,
   planSaveNodeAndEnsureNodes,
   planUpdateEmptyNodeMetadata,
+  planUpsertNodes,
 } from "./planner";
 
 export type { NodeItemMetadata } from "./nodeItemMetadata";
 
-function getNodeText(plan: Plan, viewPath: ViewPath, stack: ID[]): string {
-  return getNodeForView(plan, viewPath, stack)?.text ?? "";
-}
-
 function planUpdateExistingItemMetadata(
   plan: Plan,
-  parentViewPath: ViewPath,
-  stack: ID[],
-  nodeIndex: number,
+  parentNode: GraphNode,
+  nodeID: ID,
   metadata: NodeItemMetadata
 ): Plan {
-  const nodes = getNodeForView(plan, parentViewPath, stack);
-  const itemId = nodes?.children.get(nodeIndex);
-  return nodes && itemId
-    ? planUpdateNodeItemMetadataById(plan, nodes.id, itemId, metadata)
-    : plan;
+  return planUpdateNodeItemMetadataById(plan, parentNode.id, nodeID, metadata);
+}
+
+function planUpdateDocumentTopNodeMetadata(
+  plan: Plan,
+  input: {
+    node: GraphNode;
+    nodeID: ID;
+    viewPath: ViewPath;
+    paneIndex: number;
+    documentId: string | undefined;
+  },
+  metadata: NodeItemMetadata,
+  editorSpans: InlineSpan[] | undefined
+): Plan {
+  const { node, nodeID, viewPath, paneIndex, documentId } = input;
+  if (documentId === undefined || node.parent || !node.docId) {
+    return plan;
+  }
+
+  const basePlan =
+    editorSpans &&
+    spansText(editorSpans).trim() !== "" &&
+    spansToMarkdown(editorSpans) !== spansToMarkdown(node.spans)
+      ? planSaveNodeAndEnsureNodes(
+          plan,
+          editorSpans,
+          nodeID,
+          node,
+          viewPath,
+          undefined,
+          undefined,
+          paneIndex
+        ).plan
+      : plan;
+  const updatedNode = getNode(basePlan.knowledgeDBs, node.id, LOCAL);
+
+  return updatedNode
+    ? planUpsertNodes(basePlan, updateNodeItemMetadata(updatedNode, metadata))
+    : basePlan;
 }
 
 export function planUpdateViewItemMetadata(
   plan: Plan,
-  viewPath: ViewPath,
-  stack: ID[],
+  input: {
+    node: GraphNode;
+    nodeID: ID;
+    viewPath: ViewPath;
+    parentNode: GraphNode | undefined;
+    parentViewPath: ViewPath | undefined;
+    childIndex: number | undefined;
+    paneIndex: number;
+    paneAuthor: SourceId;
+    documentId: string | undefined;
+    isDocumentTopLevel: boolean;
+  },
   metadata: NodeItemMetadata,
-  editorText: string,
-  virtualRowsMap?: VirtualRowsMap
+  editorSpans: InlineSpan[] | undefined
 ): Plan {
-  const [rowID] = getRowIDFromView(plan, viewPath);
-  const parentView = getParentView(viewPath);
-  if (!parentView) {
-    return plan;
+  const {
+    node,
+    nodeID,
+    viewPath,
+    parentNode,
+    parentViewPath,
+    childIndex,
+    paneIndex,
+    documentId,
+  } = input;
+
+  if (!parentViewPath) {
+    return planUpdateDocumentTopNodeMetadata(
+      plan,
+      { node, nodeID, viewPath, paneIndex, documentId },
+      metadata,
+      editorSpans
+    );
   }
 
-  if (isEmptySemanticID(rowID)) {
-    const trimmed = editorText.trim();
-    if (trimmed) {
+  if (isEmptyNodeID(nodeID)) {
+    if (editorSpans && spansText(editorSpans).trim() !== "") {
       return planSaveNodeAndEnsureNodes(
         plan,
-        trimmed,
+        editorSpans,
+        nodeID,
+        node,
         viewPath,
-        stack,
+        parentNode,
+        parentViewPath,
+        paneIndex,
         metadata.relevance,
         metadata.argument
       ).plan;
     }
-    const nodes = getNodeForView(plan, parentView, stack);
-    return nodes ? planUpdateEmptyNodeMetadata(plan, nodes.id, metadata) : plan;
+    return parentNode
+      ? planUpdateEmptyNodeMetadata(plan, parentNode.id, metadata)
+      : plan;
   }
 
-  const nodeIndex = getNodeIndexForView(plan, viewPath);
-  if (nodeIndex === undefined) {
-    const virtualRow = virtualRowsMap?.get(viewPathToString(viewPath));
-    if (!virtualRow) {
-      return plan;
-    }
-    if (virtualRow.virtualType === "suggestion" && !isRefNode(virtualRow)) {
-      return planDeepCopyNode(
-        plan,
-        viewPath,
-        parentView,
-        stack,
-        undefined,
-        metadata.relevance,
-        metadata.argument
-      )[0];
-    }
-    const targetID = virtualRow.targetID || undefined;
-    const targetItem = targetID ? createRefTarget(targetID) : rowID;
-    const inheritedSourceNode = targetID
-      ? getNode(plan.knowledgeDBs, targetID, plan.user.publicKey)
-      : undefined;
-    return planAddToParent(
-      plan,
-      targetItem,
-      parentView,
-      stack,
-      undefined,
-      metadata.relevance ?? inheritedSourceNode?.relevance,
-      metadata.argument ?? inheritedSourceNode?.argument
-    )[0];
+  if (childIndex === undefined) {
+    return plan;
   }
 
-  const trimmed = editorText.trim();
   const basePlan =
-    trimmed && trimmed !== getNodeText(plan, viewPath, stack)
-      ? planSaveNodeAndEnsureNodes(plan, editorText, viewPath, stack).plan
+    editorSpans &&
+    spansText(editorSpans).trim() !== "" &&
+    spansToMarkdown(editorSpans) !== spansToMarkdown(node.spans)
+      ? planSaveNodeAndEnsureNodes(
+          plan,
+          editorSpans,
+          nodeID,
+          node,
+          viewPath,
+          parentNode,
+          parentViewPath,
+          paneIndex
+        ).plan
       : plan;
 
-  return planUpdateExistingItemMetadata(
-    basePlan,
-    parentView,
-    stack,
-    nodeIndex,
-    metadata
-  );
+  return parentNode
+    ? planUpdateExistingItemMetadata(basePlan, parentNode, nodeID, metadata)
+    : basePlan;
 }

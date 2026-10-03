@@ -1,30 +1,28 @@
 import { List, Map } from "immutable";
 import { Event, UnsignedEvent } from "nostr-tools";
-import {
-  ensureNodeNativeFields,
-  getNodeDepth,
-  shortID,
-  splitID,
-} from "./connections";
+import { ensureNodeNativeFields, getNodeDepth } from "./core/connections";
 import type { StoredDocumentRecord } from "./infra/nostr/cache/indexedDB";
-import { newDB } from "./knowledge";
-import { parseDocumentEvent } from "./markdownNodes";
+import { newDB } from "./core/knowledge";
 import {
   KIND_DELETE,
   KIND_KNOWLEDGE_DOCUMENT,
   getReplaceableKey,
 } from "./nostr";
-import { findTag, getEventMs, sortEvents } from "./nostrEvents";
+import { eventToParsed, findTag, getEventMs, sortEvents } from "./nostrEvents";
 
 export function storedDocumentToEvent(
   document: StoredDocumentRecord
-): UnsignedEvent {
+): UnsignedEvent & EventAttachment {
   return {
     pubkey: document.author,
     created_at: document.createdAt,
     kind: KIND_KNOWLEDGE_DOCUMENT,
     tags: document.tags,
     content: document.content,
+    route: { kind: "storage" },
+    ...(document.storageKey !== undefined && {
+      storageKey: document.storageKey,
+    }),
   };
 }
 
@@ -72,42 +70,43 @@ export function findDocumentNodes(
     .toList();
 
   const parsedNodes = sortEvents(deduped)
-    .flatMap((event) => parseDocumentEvent(event).valueSeq())
+    .flatMap<GraphNode>((event) => {
+      const parsed = eventToParsed(event);
+      return parsed ? parsed.nodes.valueSeq().toList() : List<GraphNode>();
+    })
     .toList();
 
   return parsedNodes.reduce((acc, node) => {
-    const id = splitID(node.id)[1];
-    const existing = acc.get(id);
+    const existing = acc.get(node.id);
     if (!existing || node.updated >= existing.updated) {
-      return acc.set(id, node);
+      return acc.set(node.id, node);
     }
     return acc;
   }, Map<string, GraphNode>());
 }
 
 export function buildKnowledgeDBFromDocumentNodes(
-  author: PublicKey,
+  author: SourceId,
   documentNodes: Map<string, GraphNode>
 ): KnowledgeData | undefined {
   if (documentNodes.size === 0) {
     return undefined;
   }
 
-  const baseKnowledgeDBs = Map<PublicKey, KnowledgeData>().set(author, {
+  const baseKnowledgeDBs = Map<SourceId, KnowledgeData>().set(author, {
     ...newDB(),
     nodes: documentNodes,
   });
 
   const nodes = documentNodes
     .valueSeq()
-    .sortBy((node) => getNodeDepth(baseKnowledgeDBs, node))
+    .sortBy((node) => getNodeDepth(baseKnowledgeDBs, node, author))
     .reduce((acc, node) => {
-      const knowledgeDBs = Map<PublicKey, KnowledgeData>().set(node.author, {
-        ...newDB(),
-        nodes: acc,
-      });
-      const normalized = ensureNodeNativeFields(knowledgeDBs, node);
-      return acc.set(shortID(normalized.id), normalized);
+      const normalized = ensureNodeNativeFields(
+        { ...newDB(), nodes: acc },
+        node
+      );
+      return acc.set(normalized.id, normalized);
     }, Map<string, GraphNode>());
 
   return {
@@ -117,7 +116,7 @@ export function buildKnowledgeDBFromDocumentNodes(
 }
 
 export function buildKnowledgeDBFromDocumentEvents(
-  author: PublicKey,
+  author: SourceId,
   events: List<UnsignedEvent | Event>
 ): KnowledgeData | undefined {
   return buildKnowledgeDBFromDocumentNodes(author, findDocumentNodes(events));

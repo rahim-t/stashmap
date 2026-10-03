@@ -1,51 +1,16 @@
-export function formatRootHeading(
-  rootText: string,
-  rootUuid: string,
-  basedOn?: LongID,
-  snapshotDTag?: string,
-  anchor?: RootAnchor,
-  systemRole?: RootSystemRole
-): string {
-  const parts = [
-    `id:${rootUuid}`,
-    ...(basedOn ? [`basedOn="${basedOn}"`] : []),
-    ...(snapshotDTag ? [`snapshot="${snapshotDTag}"`] : []),
-    ...(anchor?.snapshotContext.size
-      ? [`anchorContext="${anchor.snapshotContext.join(":")}"`]
-      : []),
-    ...(anchor?.snapshotLabels?.length
-      ? [
-          `anchorLabels="${anchor.snapshotLabels
-            .map((label) => encodeURIComponent(label))
-            .join("|")}"`,
-        ]
-      : []),
-    ...(anchor?.sourceAuthor ? [`sourceAuthor="${anchor.sourceAuthor}"`] : []),
-    ...(anchor?.sourceRootID ? [`sourceRoot="${anchor.sourceRootID}"`] : []),
-    ...(anchor?.sourceNodeID ? [`sourceNode="${anchor.sourceNodeID}"`] : []),
-    ...(anchor?.sourceParentNodeID
-      ? [`sourceParent="${anchor.sourceParentNodeID}"`]
-      : []),
-    ...(systemRole ? [`systemRole="${systemRole}"`] : []),
-  ];
-  return `# ${rootText} <!-- ${parts.join(" ")} -->`;
-}
+import { serializeFrontMatter } from "./core/knowstrFrontmatter";
 
 export function formatNodeAttrs(
   uuid: string,
   options?: {
-    hidden?: boolean;
-    basedOn?: LongID;
-    userPublicKey?: PublicKey;
+    extraAttrs?: Record<string, string>;
   }
 ): string {
   const parts: string[] = [
     ...(uuid ? [`id:${uuid}`] : []),
-    ...(options?.userPublicKey
-      ? [`userPublicKey="${options.userPublicKey}"`]
-      : []),
-    ...(options?.hidden ? ["hidden"] : []),
-    ...(options?.basedOn ? [`basedOn="${options.basedOn}"`] : []),
+    ...Object.entries(options?.extraAttrs ?? {}).map(
+      ([key, value]) => `${key}="${value}"`
+    ),
   ];
   if (parts.length === 0) {
     return "";
@@ -123,12 +88,12 @@ export function formatOrderedLine(
 
 export function formatWithFrontMatter(
   content: string,
-  frontMatter?: string
+  frontMatter?: FrontMatter
 ): string {
   if (!frontMatter) {
     return content;
   }
-  return `${frontMatter}\n${content}`;
+  return `${serializeFrontMatter(frontMatter)}\n${content}`;
 }
 
 const BULLET_LINE_RE = /^\s*-\s/;

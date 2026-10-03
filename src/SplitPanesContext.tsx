@@ -1,12 +1,17 @@
 import React, { createContext, useContext } from "react";
+import { LOCAL } from "./core/nodeRef";
 import { planUpdatePanes, usePlanner } from "./planner";
 import { useData } from "./DataContext";
 import {
-  pathToStack,
+  parseAtFromSearch,
+  parseCoordinateRouteUrl,
+  parseDocumentRouteUrl,
+  parseFallbackLabelFromSearch,
   parseNodeRouteUrl,
-  parseAuthorFromSearch,
+  parseStorageKeyFromHash,
+  resolveAddress,
+  routeCoordinateSourceId,
 } from "./navigationUrl";
-import { splitID } from "./connections";
 import { usePaneHistory } from "./PaneHistoryContext";
 
 const PaneIndexContext = createContext<number>(0);
@@ -40,17 +45,18 @@ export function useCurrentPane(): Pane {
 }
 
 export function usePaneStack(): ID[] {
-  return useCurrentPane().stack;
+  return [];
 }
 
 type PaneOperations = {
   panes: Pane[];
   addPaneAt: (
     index: number,
-    stack: ID[],
-    author: PublicKey,
-    rootNodeId?: LongID,
-    scrollToId?: string
+    sourceId: SourceId,
+    rootNodeId?: ID,
+    scrollToId?: string,
+    documentId?: string,
+    fallbackLabel?: string
   ) => void;
   removePane: (paneId: string) => void;
   setPane: (pane: Pane) => void;
@@ -63,17 +69,19 @@ export function useSplitPanes(): PaneOperations {
 
   const addPaneAt = (
     index: number,
-    stack: ID[],
-    author: PublicKey,
-    rootNodeId?: LongID,
-    scrollToId?: string
+    sourceId: SourceId,
+    rootNodeId?: ID,
+    scrollToId?: string,
+    documentId?: string,
+    fallbackLabel?: string
   ): void => {
     const newPane: Pane = {
       id: generatePaneId(),
-      stack,
-      author,
+      sourceId,
+      documentId,
       rootNodeId,
       scrollToId,
+      fallbackLabel,
     };
     const newPanes = [...panes.slice(0, index), newPane, ...panes.slice(index)];
     const plan = createPlan();
@@ -110,10 +118,10 @@ export function useNavigatePane(): (url: string) => void {
 
   return (url: string): void => {
     paneHistory?.push(pane.id, pane);
+    window.history.pushState({}, "", url);
     const hashIndex = url.indexOf("#");
     const urlWithoutHash = hashIndex >= 0 ? url.slice(0, hashIndex) : url;
-    const scrollToId =
-      hashIndex >= 0 ? decodeURIComponent(url.slice(hashIndex + 1)) : undefined;
+    const hash = hashIndex >= 0 ? url.slice(hashIndex) : "";
     const questionMarkIndex = urlWithoutHash.indexOf("?");
     const pathname =
       questionMarkIndex >= 0
@@ -121,22 +129,59 @@ export function useNavigatePane(): (url: string) => void {
         : urlWithoutHash;
     const search =
       questionMarkIndex >= 0 ? urlWithoutHash.slice(questionMarkIndex) : "";
-    const author = parseAuthorFromSearch(search) || user.publicKey;
+    const fallbackLabel = parseFallbackLabelFromSearch(search);
+    const at = parseAtFromSearch(search);
+    const documentRoute = parseDocumentRouteUrl(pathname);
+    if (documentRoute) {
+      setPane({
+        id: pane.id,
+        sourceId: LOCAL,
+        documentId: documentRoute.docId,
+        scrollToId: at,
+        fallbackLabel: undefined,
+      });
+      return;
+    }
+    const storageRoute = parseCoordinateRouteUrl(pathname, "storage");
+    if (storageRoute) {
+      const storageKey = parseStorageKeyFromHash(hash);
+      setPane({
+        id: pane.id,
+        sourceId: resolveAddress(storageRoute.pubkey, user?.publicKey),
+        routeCoordinate: storageRoute,
+        ...(at === undefined
+          ? { documentId: storageRoute.dTag }
+          : { rootNodeId: at }),
+        ...(storageKey !== undefined && { storageKey }),
+      });
+      return;
+    }
+    const depositRoute = parseCoordinateRouteUrl(pathname, "deposit");
+    if (depositRoute) {
+      setPane({
+        id: pane.id,
+        sourceId: routeCoordinateSourceId(depositRoute),
+        routeCoordinate: depositRoute,
+        ...(at === undefined
+          ? { documentId: depositRoute.dTag }
+          : { rootNodeId: at }),
+      });
+      return;
+    }
     const nodeID = parseNodeRouteUrl(pathname);
     if (nodeID) {
       setPane({
         id: pane.id,
-        stack: [],
-        author:
-          parseAuthorFromSearch(search) || splitID(nodeID)[0] || user.publicKey,
+        sourceId: LOCAL,
         rootNodeId: nodeID,
-        scrollToId,
+        scrollToId: at,
+        fallbackLabel,
       });
     } else {
       setPane({
         id: pane.id,
-        stack: pathToStack(pathname),
-        author,
+        sourceId: LOCAL,
+        fallbackLabel: undefined,
       });
     }
   };

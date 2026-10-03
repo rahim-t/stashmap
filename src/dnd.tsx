@@ -1,482 +1,554 @@
 import React from "react";
-import { List, OrderedSet, Set } from "immutable";
+import { List } from "immutable";
 import { DndProvider, useDragLayer, XYCoord } from "react-dnd";
 import { HTML5Backend } from "react-dnd-html5-backend";
-import { moveNodes, createRefTarget, isRefNode } from "./connections";
-import {
-  parseViewPath,
-  upsertNodes,
-  getParentKey,
-  ViewPath,
-  getParentView,
-  updateViewPathsAfterMoveNodes,
-  getNodeIndexForView,
-  getRowIDFromView,
-  getNodeForView,
-  getPaneIndex,
-  viewPathToString,
-  getCurrentEdgeForView,
-} from "./ViewContext";
-import { getNodesInTree } from "./components/Node";
+import { nip19 } from "nostr-tools";
+import { LOCAL } from "./core/nodeRef";
+import { moveNodes, createRefTarget, getNode } from "./core/connections";
+import { nodeText } from "./core/nodeSpans";
+import { getIndependentRows, updateViewPathsAfterMoveNodes } from "./rowModel";
+import { getDocumentForNode } from "./core/Document";
 import {
   Plan,
   planUpdateViews,
-  planDeepCopyNodeWithView,
   planExpandNode,
   planAddToParent,
-  getPane,
+  planUpsertNodes,
+  AddToParentTarget,
 } from "./planner";
-import { planMoveNodeWithView } from "./treeMutations";
+import { planMoveNode } from "./treeMutations";
+import {
+  planMaterializeComputedRow,
+  planRecordKnowstrSource,
+} from "./core/plan";
+import { sourceCoordinate } from "./navigationUrl";
+import { decodePublicKeyInputSync } from "./infra/nostr/publicKeys";
 
 type DragSource = {
-  path: ViewPath;
-  nodeId?: LongID;
-  targetId?: LongID;
-  linkText?: string;
+  row: Row;
+  draggedRows: Row[];
+  sourcePaneIndex: number;
+  text?: string;
+  isCopyDrag?: boolean;
+  nodeId?: ID;
+  insertTarget?: AddToParentTarget;
 };
 
-function getDropDestinationEndOfRoot(
-  data: Data,
-  root: ViewPath,
-  stack: ID[]
-): [ViewPath, number] {
-  const nodes = getNodeForView(data, root, stack);
-  return [root, nodes?.children.size || 0];
+function refsEqual(
+  left: NodeRef | undefined,
+  right: NodeRef | undefined
+): boolean {
+  return (
+    left !== undefined &&
+    right !== undefined &&
+    left.sourceId === right.sourceId &&
+    left.id === right.id
+  );
 }
 
-function getInsertAfterNode(
-  data: Data,
-  node: ViewPath
-): [ViewPath, number] | undefined {
-  const parentView = getParentView(node);
-  if (!parentView) {
+function getCurrentPlanNode(plan: Plan, node: GraphNode): GraphNode {
+  return getNode(plan.knowledgeDBs, node.id, LOCAL) ?? node;
+}
+
+function addFallbackLinkText(
+  target: AddToParentTarget,
+  text: string | undefined
+): AddToParentTarget {
+  if (typeof target === "string" || !("targetID" in target)) {
+    return target;
+  }
+  if (target.linkText || !text) {
+    return target;
+  }
+  return createRefTarget(target.targetID, text);
+}
+
+// Dragging a row from another user's document records that document in
+// knowstr_sources of ours — the one moment the source is known for
+// certain, so foreign ids resolve on a future fetch.
+function planRecordForeignSource(
+  plan: Plan,
+  sourcePane: Pane | undefined,
+  sourceRow: Row,
+  targetNode: GraphNode
+): Plan {
+  if (sourceRow.sourceId === LOCAL) {
+    return plan;
+  }
+  const coordinate =
+    sourcePane?.routeCoordinate ?? sourceCoordinate(sourceRow.sourceId);
+  const pubkey =
+    coordinate?.pubkey ?? decodePublicKeyInputSync(sourceRow.sourceId);
+  if (!pubkey) {
+    return plan;
+  }
+  const sourceDocument = getDocumentForNode(
+    plan.knowledgeDBs,
+    plan.documents,
+    sourceRow.node,
+    sourceRow.sourceId
+  );
+  const doc = sourceDocument?.docId ?? coordinate?.dTag;
+  if (!doc) {
+    return plan;
+  }
+  return planRecordKnowstrSource(plan, targetNode, {
+    author: nip19.npubEncode(pubkey),
+    doc,
+    relays: coordinate?.relays ?? [],
+  });
+}
+
+function isDraggedOccurrence(row: Row, sources: Row[]): boolean {
+  return sources.some(
+    (source) =>
+      row.viewKey === source.viewKey ||
+      row.viewKey.startsWith(`${source.viewKey}:`)
+  );
+}
+
+function getVisibleParentRow(rows: List<Row>, row: Row): Row | undefined {
+  if (!row.parentRef) {
     return undefined;
   }
-  const index = getNodeIndexForView(data, node);
-  if (index === undefined) {
+  return rows
+    .slice(0, row.index)
+    .reverse()
+    .find(
+      (candidate) =>
+        candidate.depth < row.depth && refsEqual(candidate.ref, row.parentRef)
+    );
+}
+
+function getVisibleRootRow(rows: List<Row>): Row | undefined {
+  const firstRow = rows.first();
+  if (!firstRow || firstRow.parentRef) {
     return undefined;
   }
-  return [parentView, index + 1];
+  return firstRow;
+}
+
+function getDropDestinationEndOfVisibleRoot(
+  rows: List<Row>
+): { parentRow: Row; insertAtIndex: number } | undefined {
+  const rootRow = getVisibleRootRow(rows);
+  return rootRow
+    ? {
+        parentRow: rootRow,
+        insertAtIndex: rootRow.node.children.size || 0,
+      }
+    : undefined;
+}
+
+// A computed row has no childIndex; its drop position derives from the
+// nearest preceding PLACED sibling in display order — your arrangement
+// wins where displayed, the merge re-slots the projections around it.
+function placedIndexAfter(rows: List<Row>, row: Row): number {
+  const previousPlaced = rows
+    .slice(0, row.index)
+    .reverse()
+    .find(
+      (candidate) =>
+        candidate.childIndex !== undefined &&
+        candidate.parentRef?.sourceId === row.parentRef?.sourceId &&
+        candidate.parentRef?.id === row.parentRef?.id
+    );
+  return previousPlaced?.childIndex !== undefined
+    ? previousPlaced.childIndex + 1
+    : 0;
+}
+
+type DropDestination = {
+  parentRow: Row;
+  insertAtIndex: number;
+  // The display row the insertion conceptually follows. When it is a
+  // computed row, the drop materializes it — arranging something
+  // relative to an entry is touching it.
+  anchorRow?: Row;
+};
+
+function getInsertAfterRow(
+  rows: List<Row>,
+  row: Row
+): DropDestination | undefined {
+  if (!row.parentRef) {
+    return {
+      parentRow: row,
+      insertAtIndex: row.node.children.size || 0,
+    };
+  }
+  const parentRow = getVisibleParentRow(rows, row);
+  if (!parentRow) {
+    return undefined;
+  }
+  return {
+    parentRow,
+    insertAtIndex:
+      row.childIndex !== undefined
+        ? row.childIndex + 1
+        : placedIndexAfter(rows, row),
+    anchorRow: row,
+  };
 }
 
 function getAncestorAtDepth(
-  path: ViewPath,
+  rows: List<Row>,
+  rowIndex: number,
   depth: number
-): ViewPath | undefined {
-  if (path.length - 1 <= depth) {
-    return path;
-  }
-  const parent = getParentView(path);
-  if (!parent) {
+): Row | undefined {
+  const row = rows.get(rowIndex);
+  if (!row) {
     return undefined;
   }
-  return getAncestorAtDepth(parent, depth);
+  if (row.depth <= depth) {
+    return row;
+  }
+  return rows
+    .slice(0, rowIndex)
+    .reverse()
+    .find((candidate) => candidate.depth === depth);
+}
+
+function getDropBeforeParentDestination(
+  rows: List<Row>,
+  dropBefore: Row
+): DropDestination | undefined {
+  const parentRow = getVisibleParentRow(rows, dropBefore);
+  if (!parentRow) {
+    return getDropDestinationEndOfVisibleRoot(rows);
+  }
+  // Inserting before a row = after its display predecessor under the
+  // same parent, which may be a computed row.
+  const displayPredecessor = rows.get(dropBefore.index - 1);
+  const anchorRow =
+    displayPredecessor &&
+    displayPredecessor.parentRef?.sourceId === dropBefore.parentRef?.sourceId &&
+    displayPredecessor.parentRef?.id === dropBefore.parentRef?.id
+      ? displayPredecessor
+      : undefined;
+  return {
+    parentRow,
+    insertAtIndex: dropBefore.childIndex ?? placedIndexAfter(rows, dropBefore),
+    anchorRow,
+  };
+}
+
+function getRootDepth(rows: List<Row>): number {
+  const firstRow = rows.first();
+  if (!firstRow) {
+    return 0;
+  }
+  return firstRow.parentRef ? firstRow.depth - 1 : firstRow.depth;
+}
+
+function findNextNonDraggedRow(
+  rows: List<Row>,
+  startIndex: number,
+  sources: Row[]
+): Row | undefined {
+  return rows
+    .slice(startIndex)
+    .find((row) => !isDraggedOccurrence(row, sources));
 }
 
 function resolveDropByDepth(
-  data: Data,
-  root: ViewPath,
-  stack: ID[],
-  prevNode: ViewPath | undefined,
-  dropBefore: ViewPath | undefined,
+  rows: List<Row>,
+  prevRow: Row,
+  dropBefore: Row | undefined,
   targetDepth: number
-): [ViewPath, number] {
-  const rootDepth = root.length - 1;
-  const maxDepth = prevNode ? prevNode.length - 1 + 1 : rootDepth + 1;
-  const minDepth = dropBefore ? dropBefore.length - 1 : rootDepth + 1;
+): { parentRow: Row; insertAtIndex: number } | undefined {
+  const rootDepth = getRootDepth(rows);
+  const maxDepth = prevRow.depth + 1;
+  const minDepth = dropBefore ? dropBefore.depth : rootDepth + 1;
   const clampedDepth = Math.max(minDepth, Math.min(maxDepth, targetDepth));
 
-  if (!prevNode) {
-    if (!dropBefore) {
-      return getDropDestinationEndOfRoot(data, root, stack);
+  if (clampedDepth === prevRow.depth + 1) {
+    if (dropBefore && dropBefore.depth === clampedDepth) {
+      return {
+        parentRow: prevRow,
+        insertAtIndex: dropBefore.childIndex ?? prevRow.node.children.size,
+      };
     }
-    const parentView = getParentView(dropBefore);
-    if (!parentView) {
-      return getDropDestinationEndOfRoot(data, root, stack);
-    }
-    const idx = getNodeIndexForView(data, dropBefore);
-    return [parentView, idx || 0];
+    return {
+      parentRow: prevRow,
+      insertAtIndex: prevRow.node.children.size || 0,
+    };
   }
 
-  const prevDepth = prevNode.length - 1;
-  if (clampedDepth === prevDepth + 1) {
-    if (dropBefore && dropBefore.length - 1 === clampedDepth) {
-      const idx = getNodeIndexForView(data, dropBefore);
-      return [prevNode, idx ?? 0];
-    }
-    const node = getNodeForView(data, prevNode, stack);
-    return [prevNode, node?.children.size || 0];
-  }
-
-  const ancestor = getAncestorAtDepth(prevNode, clampedDepth);
+  const ancestor = getAncestorAtDepth(rows, prevRow.index, clampedDepth);
   if (ancestor) {
-    const afterAncestor = getInsertAfterNode(data, ancestor);
+    const afterAncestor = getInsertAfterRow(rows, ancestor);
     if (afterAncestor) {
       return afterAncestor;
     }
   }
 
-  return getDropDestinationEndOfRoot(data, root, stack);
+  return getDropDestinationEndOfVisibleRoot(rows);
 }
 
-function findNextNonSource(
-  nodes: List<ViewPath>,
-  startIndex: number,
-  sourceKeys: Set<string>,
-  skipDepth?: number
-): ViewPath | undefined {
-  const node = nodes.get(startIndex);
-  if (!node) {
-    return undefined;
-  }
-  const depth = node.length - 1;
-  if (skipDepth !== undefined && depth > skipDepth) {
-    return findNextNonSource(nodes, startIndex + 1, sourceKeys, skipDepth);
-  }
-  if (sourceKeys.has(viewPathToString(node))) {
-    return findNextNonSource(nodes, startIndex + 1, sourceKeys, depth);
-  }
-  return node;
-}
-
-export function getDropDestinationFromTreeView(
-  data: Data,
-  root: ViewPath,
-  stack: ID[],
-  destinationIndex: number,
-  rootNode: LongID | undefined,
-  targetDepth?: number,
-  sourceKeys?: Set<string>
-): [ViewPath, number] {
-  const pane = getPane(data, root);
-  const { paths: nodes } = getNodesInTree(
-    data,
-    root,
-    stack,
-    List<ViewPath>(),
-    rootNode,
-    pane.author,
-    pane.typeFilters
-  );
-  const adjustedIndex = destinationIndex - 1;
-  const dropBefore = nodes.get(adjustedIndex);
-  const prevNode = adjustedIndex > 0 ? nodes.get(adjustedIndex - 1) : undefined;
+export function getDropDestinationFromRows(
+  rows: List<Row>,
+  targetRow: Row,
+  targetDepth: number | undefined,
+  sources: Row[]
+): DropDestination | undefined {
+  const dropBefore = findNextNonDraggedRow(rows, targetRow.index + 1, sources);
 
   if (targetDepth !== undefined) {
-    const realDropBefore = sourceKeys
-      ? findNextNonSource(nodes, adjustedIndex, sourceKeys)
-      : dropBefore;
-    return resolveDropByDepth(
-      data,
-      root,
-      stack,
-      prevNode,
-      realDropBefore,
-      targetDepth
-    );
+    return resolveDropByDepth(rows, targetRow, dropBefore, targetDepth);
   }
 
   if (!dropBefore) {
-    const lastNode = nodes.last();
-    if (lastNode) {
-      const afterLast = getInsertAfterNode(data, lastNode);
-      if (afterLast) {
-        return afterLast;
-      }
-    }
-    return getDropDestinationEndOfRoot(data, root, stack);
+    return getInsertAfterRow(rows, targetRow);
   }
-  if (prevNode && prevNode.length > dropBefore.length) {
-    const afterPrev = getInsertAfterNode(data, prevNode);
-    if (afterPrev) {
-      return afterPrev;
+  if (targetRow.depth > dropBefore.depth) {
+    const afterTarget = getInsertAfterRow(rows, targetRow);
+    if (afterTarget) {
+      return afterTarget;
     }
   }
-  const parentView = getParentView(dropBefore);
-  if (!parentView) {
-    return getDropDestinationEndOfRoot(data, root, stack);
-  }
-  const index = getNodeIndexForView(data, dropBefore);
-  return [parentView, index || 0];
+  return getDropBeforeParentDestination(rows, dropBefore);
 }
 
 export function dnd(
-  plan: Plan,
-  selection: OrderedSet<string>,
+  basePlan: Plan,
   sourceDrag: DragSource,
-  to: ViewPath,
-  stack: ID[],
-  indexTo: number | undefined,
-  rootNode: LongID | undefined,
-  isSuggestion?: boolean,
-  invertCopyMode?: boolean,
-  targetDepth?: number,
-  isCopyDrag?: boolean
+  targetPaneIndex: number,
+  targetParentRow: Row,
+  dropIndex: number
 ): Plan {
-  const rootView = to;
-
-  const source = viewPathToString(sourceDrag.path);
-  const sourceViewPath = sourceDrag.path;
-  const sources = selection.contains(source) ? selection : OrderedSet([source]);
-
-  const independentSources = sources.filterNot((s) =>
-    sources.some((other) => s !== other && s.startsWith(`${other}:`))
+  const source = sourceDrag.row.viewKey;
+  const sources = sourceDrag.draggedRows.length
+    ? sourceDrag.draggedRows
+    : [sourceDrag.row];
+  const independentRows = getIndependentRows(sources);
+  // Projected embed content is readonly: nothing drops into it, and its
+  // rows don't drag out yet — materializing from an embed is later work.
+  if (
+    targetParentRow.projected ||
+    independentRows.some((row) => row.projected)
+  ) {
+    return basePlan;
+  }
+  const [plan, targetParentNode] = planMaterializeComputedRow(
+    basePlan,
+    targetParentRow
   );
 
-  const sourceParentPath = getParentView(sourceViewPath);
-  const sourceKeys = Set(sources.map((s) => s));
-  const [toView, dropIndex] =
-    indexTo === undefined
-      ? [rootView, undefined]
-      : getDropDestinationFromTreeView(
-          plan,
-          rootView,
-          stack,
-          indexTo,
-          rootNode,
-          targetDepth,
-          sourceKeys
-        );
+  const sourcePane = plan.panes[sourceDrag.sourcePaneIndex];
+  const targetPane = plan.panes[targetPaneIndex];
+  if (!sourcePane || !targetPane) {
+    return plan;
+  }
+  const sourceDocument = getDocumentForNode(
+    plan.knowledgeDBs,
+    plan.documents,
+    sourceDrag.row.node,
+    sourceDrag.row.sourceId
+  );
+  const targetSourceId = targetParentRow.materialize
+    ? LOCAL
+    : targetParentRow.sourceId;
+  const targetDocument = getDocumentForNode(
+    plan.knowledgeDBs,
+    plan.documents,
+    targetParentNode,
+    targetSourceId
+  );
+  const isSameDocument =
+    sourceDocument !== undefined &&
+    targetDocument !== undefined &&
+    sourceDocument.sourceId === targetDocument.sourceId &&
+    sourceDocument.docId === targetDocument.docId;
+  const isDocumentTopLevelSource =
+    sourceDocument !== undefined &&
+    sourceDocument.sourceId === sourceDrag.row.sourceId &&
+    sourceDocument.topNodeShortIds.includes(sourceDrag.row.node.id);
 
-  const fromNode = sourceParentPath
-    ? getNodeForView(plan, sourceParentPath, stack)
-    : undefined;
-  const toNode = getNodeForView(plan, toView, stack);
+  if (isDocumentTopLevelSource && isSameDocument && !sourceDrag.isCopyDrag) {
+    return plan;
+  }
 
-  const sourcePaneIndex = getPaneIndex(sourceViewPath);
-  const targetPaneIndex = getPaneIndex(rootView);
-  const isSamePane = sourcePaneIndex === targetPaneIndex;
-
-  const sourceParentKey = getParentKey(source);
+  const sourceParentRef = sourceDrag.row.parentRef;
   const allSourcesSameParent =
-    !selection.contains(source) ||
-    independentSources.every((s) => getParentKey(s) === sourceParentKey);
+    sourceParentRef !== undefined &&
+    independentRows.every((row) => refsEqual(row.parentRef, sourceParentRef));
+  const targetParentRef = { sourceId: targetSourceId, id: targetParentNode.id };
   const sameNode =
-    allSourcesSameParent &&
-    fromNode !== undefined &&
-    toNode !== undefined &&
-    fromNode.id === toNode.id;
+    allSourcesSameParent && refsEqual(sourceParentRef, targetParentRef);
 
-  const skipMoveLogic = isSuggestion || isCopyDrag;
-  const reorder =
-    isSamePane && !skipMoveLogic && sameNode && dropIndex !== undefined;
+  const skipMoveLogic = sourceDrag.isCopyDrag;
+  const reorder = isSameDocument && !skipMoveLogic && sameNode;
 
   const addProjectedSourceAsReference = (
     accPlan: Plan,
-    sourcePath: ViewPath,
+    sourceRow: Row,
     insertAt: number
   ): Plan => {
-    const [sourceItemID] = getRowIDFromView(accPlan, sourcePath);
-    const sourceStack = getPane(accPlan, sourcePath).stack;
-    const sourceNode = getNodeForView(accPlan, sourcePath, sourceStack);
+    if (sourceRow.materialize) {
+      const [materializedPlan, materializedNode, materializedNow] =
+        planMaterializeComputedRow(accPlan, sourceRow, undefined, {
+          parentID: targetParentNode.id,
+          insertIndex: insertAt,
+        });
+      if (materializedNow || !sourceRow.parentRef) {
+        return materializedPlan;
+      }
+      // Same-parent: an in-place reorder (planMoveNode is add-then-
+      // disconnect and not same-parent-safe). Cross-parent: a move.
+      if (sourceRow.parentRef.id === targetParentNode.id) {
+        const parentNode = getCurrentPlanNode(
+          materializedPlan,
+          targetParentNode
+        );
+        const fromIndex = parentNode.children.indexOf(materializedNode.id);
+        if (fromIndex < 0) {
+          return materializedPlan;
+        }
+        const reordered = planUpsertNodes(
+          materializedPlan,
+          moveNodes(parentNode, [fromIndex], insertAt)
+        );
+        return planUpdateViews(
+          reordered,
+          updateViewPathsAfterMoveNodes(reordered)
+        );
+      }
+      return planMoveNode(
+        materializedPlan,
+        materializedNode.id,
+        materializedNode.id,
+        sourceRow.parentRef.id,
+        sourceRow.viewPath,
+        targetParentNode.id,
+        targetParentRow.viewPath,
+        insertAt
+      );
+    }
     return planAddToParent(
       accPlan,
-      createRefTarget(
-        sourceNode?.id || (sourceItemID as LongID),
-        sourceNode?.linkText
-      ),
-      toView,
-      stack,
+      createRefTarget(sourceRow.node.id, nodeText(sourceRow.node)),
+      targetParentNode.id,
       insertAt
     )[0];
   };
 
   if (reorder) {
-    const realSources = independentSources.filter(
-      (n) => getNodeIndexForView(plan, parseViewPath(n)) !== undefined
+    const realRows = independentRows.filter(
+      (row) => row.childIndex !== undefined
     );
-    const virtualSources = independentSources.filter(
-      (n) => getNodeIndexForView(plan, parseViewPath(n)) === undefined
+    const virtualRows = independentRows.filter(
+      (row) => row.childIndex === undefined
     );
-    const sourceIndices = List(
-      realSources.map((n) => getNodeIndexForView(plan, parseViewPath(n)))
-    ).filter((n) => n !== undefined) as List<number>;
-    const updatedNodesPlan = upsertNodes(
+    const sourceIndices = realRows.flatMap((row) =>
+      row.childIndex === undefined ? [] : [row.childIndex]
+    );
+    const targetNode = getCurrentPlanNode(plan, targetParentNode);
+    const updatedNodesPlan = planUpsertNodes(
       plan,
-      toView,
-      stack,
-      (nodes: GraphNode) => {
-        return moveNodes(nodes, sourceIndices.toArray(), dropIndex);
-      }
+      moveNodes(targetNode, sourceIndices, dropIndex)
     );
     const updatedViews = updateViewPathsAfterMoveNodes(updatedNodesPlan);
     const reorderedPlan = planUpdateViews(updatedNodesPlan, updatedViews);
-    return virtualSources
-      .toList()
-      .reduce((accPlan: Plan, s: string, idx: number) => {
-        const sourcePath = parseViewPath(s);
-        const insertAt = dropIndex + sourceIndices.size + idx;
-        return addProjectedSourceAsReference(accPlan, sourcePath, insertAt);
-      }, reorderedPlan);
+    return virtualRows.reduce((accPlan: Plan, sourceRow, idx) => {
+      const insertAt = dropIndex + sourceIndices.length + idx;
+      return addProjectedSourceAsReference(accPlan, sourceRow, insertAt);
+    }, reorderedPlan);
   }
 
-  const samePaneMove =
-    isSamePane &&
-    !skipMoveLogic &&
-    !invertCopyMode &&
-    !sameNode &&
-    dropIndex !== undefined;
+  const sameDocumentMove = isSameDocument && !skipMoveLogic && !sameNode;
 
-  if (samePaneMove) {
-    const toViewStr = viewPathToString(toView);
-    const isDropIntoOwnDescendant = independentSources.some(
-      (s) => toViewStr === s || toViewStr.startsWith(`${s}:`)
+  if (sameDocumentMove) {
+    const isDropIntoOwnDescendant = independentRows.some(
+      (row) =>
+        targetParentRow.viewKey === row.viewKey ||
+        targetParentRow.viewKey.startsWith(`${row.viewKey}:`)
     );
     if (isDropIntoOwnDescendant) {
       return plan;
     }
-    const realSources = independentSources.filter(
-      (n) => getNodeIndexForView(plan, parseViewPath(n)) !== undefined
+    const realRows = independentRows.filter(
+      (row) => row.childIndex !== undefined
     );
-    const virtualSources = independentSources.filter(
-      (n) => getNodeIndexForView(plan, parseViewPath(n)) === undefined
+    const virtualRows = independentRows.filter(
+      (row) => row.childIndex === undefined
     );
-    const movedPlan = realSources
-      .toList()
-      .reduce((accPlan: Plan, s: string, idx: number) => {
-        const sourcePath = parseViewPath(s);
-        const insertAt = dropIndex + idx;
-        return planMoveNodeWithView(
-          accPlan,
-          sourcePath,
-          toView,
-          stack,
-          insertAt
-        );
-      }, plan);
-    return virtualSources
-      .toList()
-      .reduce((accPlan: Plan, s: string, idx: number) => {
-        const sourcePath = parseViewPath(s);
-        const insertAt = dropIndex + realSources.size + idx;
-        return addProjectedSourceAsReference(accPlan, sourcePath, insertAt);
-      }, movedPlan);
-  }
-
-  const [, toViewData] = getRowIDFromView(plan, toView);
-
-  const expandedPlan = toViewData.expanded
-    ? plan
-    : planExpandNode(plan, toViewData, toView);
-
-  const shouldCreateReference = (
-    sourceItemID: ID,
-    sourceNode?: GraphNode
-  ): boolean => {
-    if (isSuggestion) {
-      return !!invertCopyMode;
-    }
-    if (isCopyDrag) {
-      return true;
-    }
-    const sourceIsReference = isRefNode(sourceNode);
-    if (sourceIsReference) {
-      return true;
-    }
-    return !!invertCopyMode;
-  };
-
-  const toReferenceTarget = (
-    sourceNode: GraphNode
-  ): ReturnType<typeof createRefTarget> =>
-    createRefTarget(sourceNode.targetID || sourceNode.id, sourceNode.linkText);
-
-  const getSuggestionTargetID = (
-    isPrimarySource: boolean,
-    sourceNode?: GraphNode
-  ): LongID | undefined => {
-    if (isPrimarySource) {
-      return sourceDrag.targetId || sourceDrag.nodeId;
-    }
-    if (sourceNode) {
-      return sourceNode.targetID || sourceNode.id;
-    }
-    return undefined;
-  };
-
-  return independentSources
-    .toList()
-    .reduce((accPlan: Plan, s: string, idx: number) => {
-      const sourcePath = parseViewPath(s);
-      const [sourceItemID] = getRowIDFromView(accPlan, sourcePath);
-      const sourceStack = getPane(accPlan, sourcePath).stack;
-      const sourceEdge = getCurrentEdgeForView(accPlan, sourcePath);
-      const sourceEdgeRelevance = sourceEdge?.relevance;
-      const sourceEdgeArgument = sourceEdge?.argument;
-      const sourceNode =
-        getNodeForView(accPlan, sourcePath, sourceStack) || sourceEdge;
-      const insertAt = dropIndex !== undefined ? dropIndex + idx : undefined;
-
-      if (shouldCreateReference(sourceItemID, sourceNode)) {
-        if (isSuggestion) {
-          const sourceTargetID = getSuggestionTargetID(
-            s === source,
-            sourceNode
-          );
-          if (sourceTargetID) {
-            return planAddToParent(
-              accPlan,
-              createRefTarget(sourceTargetID),
-              toView,
-              stack,
-              insertAt
-            )[0];
-          }
-        }
-        const dragTargetID =
-          s === source ? sourceDrag.targetId || sourceDrag.nodeId : undefined;
-        if (dragTargetID) {
-          return planAddToParent(
-            accPlan,
-            createRefTarget(dragTargetID, sourceDrag.linkText),
-            toView,
-            stack,
-            insertAt,
-            sourceEdgeRelevance,
-            sourceEdgeArgument
-          )[0];
-        }
-        if (sourceNode) {
-          return planAddToParent(
-            accPlan,
-            toReferenceTarget(sourceNode),
-            toView,
-            stack,
-            insertAt,
-            sourceEdgeRelevance,
-            sourceEdgeArgument
-          )[0];
-        }
-        const planWithNode = upsertNodes(
-          accPlan,
-          sourcePath,
-          sourceStack,
-          (r) => r
-        );
-        const sourceNodeWithUpsert = getNodeForView(
-          planWithNode,
-          sourcePath,
-          sourceStack
-        )!;
-        return planAddToParent(
-          planWithNode,
-          toReferenceTarget(sourceNodeWithUpsert),
-          toView,
-          stack,
-          insertAt,
-          sourceEdgeRelevance,
-          sourceEdgeArgument
-        )[0];
+    const moveBasePlan = targetParentRow.view.expanded
+      ? plan
+      : planExpandNode(plan, targetParentRow.view, targetParentRow.viewPath);
+    const movedPlan = realRows.reduce((accPlan: Plan, sourceRow, idx) => {
+      if (!sourceRow.parentNode) {
+        return accPlan;
       }
-
-      return planDeepCopyNodeWithView(
+      const insertAt = dropIndex + idx;
+      return planMoveNode(
         accPlan,
-        sourcePath,
-        toView,
-        stack,
+        sourceRow.node.id,
+        sourceRow.node.id,
+        sourceRow.parentNode.id,
+        sourceRow.viewPath,
+        targetParentNode.id,
+        targetParentRow.viewPath,
         insertAt
       );
-    }, expandedPlan);
+    }, moveBasePlan);
+    return virtualRows.reduce((accPlan: Plan, sourceRow, idx) => {
+      const insertAt = dropIndex + realRows.length + idx;
+      return addProjectedSourceAsReference(accPlan, sourceRow, insertAt);
+    }, movedPlan);
+  }
+
+  const expandedPlan = targetParentRow.view.expanded
+    ? plan
+    : planExpandNode(plan, targetParentRow.view, targetParentRow.viewPath);
+
+  const toReferenceTarget = (sourceRow: Row): AddToParentTarget =>
+    createRefTarget(sourceRow.node.id, nodeText(sourceRow.node));
+
+  return independentRows.reduce((accPlan: Plan, sourceRow, idx) => {
+    const sourceNode = sourceRow.node;
+    const sourceEdgeRelevance = sourceNode.relevance;
+    const sourceEdgeArgument = sourceNode.argument;
+    const insertAt = dropIndex + idx;
+    const isPrimarySource = sourceRow.viewKey === source;
+    const targetNode = getCurrentPlanNode(accPlan, targetParentNode);
+    const planWithSource =
+      targetSourceId === LOCAL
+        ? planRecordForeignSource(accPlan, sourcePane, sourceRow, targetNode)
+        : accPlan;
+    const insertTarget =
+      sourceRow.materialize?.take ??
+      (isPrimarySource ? sourceDrag.insertTarget : undefined);
+    const dragTargetID = isPrimarySource ? sourceDrag.nodeId : undefined;
+    if (insertTarget) {
+      return planAddToParent(
+        planWithSource,
+        addFallbackLinkText(insertTarget, sourceDrag.text),
+        targetNode.id,
+        insertAt,
+        sourceEdgeRelevance,
+        sourceEdgeArgument
+      )[0];
+    }
+    if (dragTargetID) {
+      return planAddToParent(
+        planWithSource,
+        createRefTarget(dragTargetID, nodeText(sourceNode)),
+        targetNode.id,
+        insertAt,
+        sourceEdgeRelevance,
+        sourceEdgeArgument
+      )[0];
+    }
+    return planAddToParent(
+      planWithSource,
+      toReferenceTarget(sourceRow),
+      targetNode.id,
+      insertAt,
+      sourceEdgeRelevance,
+      sourceEdgeArgument
+    )[0];
+  }, expandedPlan);
 }
 
 function CustomDragLayer(): JSX.Element | null {

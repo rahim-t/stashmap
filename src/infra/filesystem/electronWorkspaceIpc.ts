@@ -1,19 +1,23 @@
 import { LoadedCliProfile } from "../../cli/config";
 import { WorkspaceIpc, WorkspaceLoaded } from "./FilesystemBackendProvider";
-import type { Document } from "../../Document";
-import type { FsEvent, FsEventHandler } from "../../core/workspaceWatcher";
+import type {
+  WorkspaceMarkdownFile,
+  WorkspaceWriteRequest,
+} from "./workspaceBackend";
+import type { FsEvent, FsEventHandler } from "./workspaceWatcher";
+import type { WorkspaceConfig } from "../../workspaceConfig";
 
 export type IpcChannel = {
   load: () => Promise<{
     profile: LoadedCliProfile;
-    documents: Document[];
+    files: WorkspaceMarkdownFile[];
   } | null>;
   pickFolder: () => Promise<string | null>;
   open: (folder: string) => Promise<void>;
-  create: (args: { folder: string; secretKeyInput?: string }) => Promise<void>;
-  isInitialised: (folder: string) => Promise<boolean>;
+  create: (args: { folder: string }) => Promise<void>;
+  configure: (config: WorkspaceConfig) => Promise<void>;
   save: (
-    documents: ReadonlyArray<Document>,
+    writes: ReadonlyArray<WorkspaceWriteRequest>,
     deletedPaths?: ReadonlyArray<string>
   ) => Promise<{ changed_paths: string[]; removed_paths: string[] }>;
   onFsEvent: (listener: (event: FsEvent) => void) => () => void;
@@ -58,19 +62,19 @@ export function electronWorkspaceIpc(): WorkspaceIpc {
       }
       await channel.create(args);
     },
-    isInitialised: async (folder) => {
+    configure: async (config) => {
       const channel = getChannel();
       if (!channel) {
-        return false;
+        throw new Error("Electron workspace bridge not available");
       }
-      return channel.isInitialised(folder);
+      await channel.configure(config);
     },
-    save: async (documents, deletedPaths) => {
+    save: async (writes, deletedPaths) => {
       const channel = getChannel();
       if (!channel) {
         return { changed_paths: [], removed_paths: [] };
       }
-      return channel.save(documents, deletedPaths);
+      return channel.save(writes, deletedPaths);
     },
     subscribeFsEvents: (handler: FsEventHandler) => {
       const channel = getChannel();

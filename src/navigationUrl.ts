@@ -1,75 +1,266 @@
-import { getTextForSemanticID } from "./semanticProjection";
+import { nip19 } from "nostr-tools";
+import { LOCAL } from "./core/nodeRef";
+import {
+  decodePublicKeyInputSync,
+  encodePublicKeyAddress,
+} from "./infra/nostr/publicKeys";
+import { KIND_KNOWLEDGE_DEPOSIT, KIND_KNOWLEDGE_DOCUMENT } from "./nostr";
+import { normalizeRelayHintUrl } from "./workspaceConfig";
 
-function stackToPath(
-  stack: ID[],
-  knowledgeDBs: KnowledgeDBs,
-  author: PublicKey
-): string | undefined {
-  if (stack.length === 0) {
-    return "/";
+export const MAX_ROUTE_RELAY_HINTS = 3;
+
+export function resolveAddress(
+  address: SourceId | undefined,
+  myPublicKey: PublicKey | undefined
+): SourceId {
+  if (!address || address === LOCAL) {
+    return LOCAL;
   }
-  const segments = stack.reduce<string[] | undefined>((acc, semanticID) => {
-    if (!acc) {
-      return undefined;
-    }
-    const text = getTextForSemanticID(knowledgeDBs, semanticID, author);
-    if (!text) {
-      return undefined;
-    }
-    return [...acc, encodeURIComponent(text)];
-  }, []);
-  if (!segments) {
+  const normalized = decodePublicKeyInputSync(address) ?? address;
+  if (myPublicKey !== undefined && normalized === myPublicKey) {
+    return LOCAL;
+  }
+  return normalized;
+}
+
+export function addressForSource(
+  sourceId: SourceId,
+  myPublicKey: PublicKey | undefined
+): string | undefined {
+  if (sourceId !== LOCAL) {
+    return sourceId;
+  }
+  return myPublicKey ? encodePublicKeyAddress(myPublicKey) : undefined;
+}
+
+export type NodeRouteOptions = {
+  scrollToId: ID | undefined;
+  fallbackLabel: string | undefined;
+};
+
+function normalizedRelayHints(relays: readonly string[]): string[] {
+  return [
+    ...new Set(
+      relays
+        .map((relay) => normalizeRelayHintUrl(relay))
+        .filter((relay): relay is string => relay !== undefined)
+    ),
+  ].slice(0, MAX_ROUTE_RELAY_HINTS);
+}
+
+export function routeCoordinateSourceId(coordinate: RouteCoordinate): SourceId {
+  return `${coordinate.eventKind}:${coordinate.pubkey}:${coordinate.dTag}`;
+}
+
+export function sourceCoordinate(
+  sourceId: SourceId
+): RouteCoordinate | undefined {
+  const [kindText, pubkeyText, ...dParts] = sourceId.split(":");
+  const dTag = dParts.join(":");
+  const kind = Number(kindText);
+  if (
+    (kind !== KIND_KNOWLEDGE_DOCUMENT && kind !== KIND_KNOWLEDGE_DEPOSIT) ||
+    !dTag
+  ) {
     return undefined;
   }
-  return `/n/${segments.join("/")}`;
-}
-
-export function pathToStack(pathname: string): ID[] {
-  if (!pathname.startsWith("/n/")) {
-    return [];
-  }
-  const rest = pathname.slice(3);
-  if (!rest) {
-    return [];
-  }
-  return rest
-    .split("/")
-    .filter((seg) => seg.length > 0)
-    .map((seg) => decodeURIComponent(seg) as ID);
-}
-
-export function buildNodeUrl(
-  stack: ID[],
-  knowledgeDBs: KnowledgeDBs,
-  myself: PublicKey,
-  author?: PublicKey
-): string | undefined {
-  const effectiveAuthor = author || myself;
-  const path = stackToPath(stack, knowledgeDBs, effectiveAuthor);
-  if (!path) {
+  const pubkey = decodePublicKeyInputSync(pubkeyText);
+  if (!pubkey) {
     return undefined;
   }
-  if (author && author !== myself) {
-    return `${path}?author=${author}`;
+  return { eventKind: kind, pubkey, dTag, relays: [] };
+}
+
+export function buildCoordinateRouteUrl(
+  prefix: "storage" | "deposit",
+  coordinate: RouteCoordinate,
+  at: ID | undefined,
+  storageKey: string | undefined
+): string {
+  const naddr = nip19.naddrEncode({
+    kind: coordinate.eventKind,
+    pubkey: coordinate.pubkey,
+    identifier: coordinate.dTag,
+    relays: normalizedRelayHints(coordinate.relays),
+  });
+  const params = new URLSearchParams();
+  if (at !== undefined) {
+    params.set("at", at);
   }
-  return path;
+  const query = params.toString();
+  const fragment = storageKey ? `#key=${encodeURIComponent(storageKey)}` : "";
+  return `/${prefix}/${naddr}${query ? `?${query}` : ""}${fragment}`;
 }
 
-export function buildNodeRouteUrl(rootNode: LongID, scrollToId?: ID): string {
-  const base = `/r/${encodeURIComponent(rootNode)}`;
-  return scrollToId ? `${base}#${encodeURIComponent(scrollToId)}` : base;
+function storageCoordinate(
+  author: SourceId,
+  docId: string
+): RouteCoordinate | undefined {
+  const pubkey = decodePublicKeyInputSync(author);
+  if (!pubkey) {
+    return undefined;
+  }
+  return {
+    eventKind: KIND_KNOWLEDGE_DOCUMENT,
+    pubkey,
+    dTag: docId,
+    relays: [],
+  };
 }
 
-export function parseNodeRouteUrl(pathname: string): LongID | undefined {
-  const match = pathname.match(/^\/r\/(.+)$/);
+export function buildNodeRouteUrl(
+  rootNode: ID,
+  sourceId: SourceId,
+  options: NodeRouteOptions,
+  routeCoordinate?: RouteCoordinate
+): string {
+  if (sourceId === LOCAL) {
+    const params = new URLSearchParams();
+    if (options.scrollToId !== undefined) {
+      params.set("at", options.scrollToId);
+    }
+    if (options.fallbackLabel !== undefined && options.fallbackLabel !== "") {
+      params.set("label", options.fallbackLabel);
+    }
+    const query = params.toString();
+    return `/local/n/${encodeURIComponent(rootNode)}${
+      query ? `?${query}` : ""
+    }`;
+  }
+  const coordinate =
+    routeCoordinate ??
+    sourceCoordinate(sourceId) ??
+    storageCoordinate(sourceId, rootNode);
+  if (!coordinate) {
+    return `/local/n/${encodeURIComponent(rootNode)}`;
+  }
+  const prefix =
+    coordinate.eventKind === KIND_KNOWLEDGE_DEPOSIT ? "deposit" : "storage";
+  return buildCoordinateRouteUrl(
+    prefix,
+    coordinate,
+    options.scrollToId ?? rootNode,
+    undefined
+  );
+}
+
+export function buildDocumentRouteUrl(
+  author: SourceId,
+  docId: string,
+  scrollToId?: string,
+  routeCoordinate?: RouteCoordinate
+): string {
+  if (author === LOCAL) {
+    const params = new URLSearchParams();
+    if (scrollToId !== undefined) {
+      params.set("at", scrollToId);
+    }
+    const query = params.toString();
+    return `/local/d/${encodeURIComponent(docId)}${query ? `?${query}` : ""}`;
+  }
+  const coordinate =
+    routeCoordinate ??
+    sourceCoordinate(author) ??
+    storageCoordinate(author, docId);
+  if (!coordinate) {
+    return `/local/d/${encodeURIComponent(docId)}`;
+  }
+  const prefix =
+    coordinate.eventKind === KIND_KNOWLEDGE_DEPOSIT ? "deposit" : "storage";
+  return buildCoordinateRouteUrl(prefix, coordinate, scrollToId, undefined);
+}
+
+export function parseNodeRouteUrl(pathname: string): ID | undefined {
+  const match = pathname.match(/^\/local\/n\/(.+)$/u);
   if (!match) {
     return undefined;
   }
-  return decodeURIComponent(match[1]) as LongID;
+  return decodeURIComponent(match[1]);
 }
 
-export function parseAuthorFromSearch(search: string): PublicKey | undefined {
+export function parseDocumentRouteUrl(
+  pathname: string
+): { address: SourceId; docId: string } | undefined {
+  const match = pathname.match(/^\/local\/d\/(.+)$/u);
+  if (!match) {
+    return undefined;
+  }
+  return {
+    address: LOCAL,
+    docId: decodeURIComponent(match[1]),
+  };
+}
+
+export function parseCoordinateRouteUrl(
+  pathname: string,
+  prefix: "storage" | "deposit"
+): RouteCoordinate | undefined {
+  const match = pathname.match(new RegExp(`^/${prefix}/(.+)$`, "u"));
+  if (!match) {
+    return undefined;
+  }
+  try {
+    const decoded = nip19.decode(decodeURIComponent(match[1]));
+    if (decoded.type !== "naddr") {
+      return undefined;
+    }
+    const expectedKind =
+      prefix === "storage" ? KIND_KNOWLEDGE_DOCUMENT : KIND_KNOWLEDGE_DEPOSIT;
+    if (decoded.data.kind !== expectedKind) {
+      return undefined;
+    }
+    const pubkey = decodePublicKeyInputSync(decoded.data.pubkey);
+    if (!pubkey || decoded.data.identifier === "") {
+      return undefined;
+    }
+    return {
+      eventKind: decoded.data.kind,
+      pubkey,
+      dTag: decoded.data.identifier,
+      relays: normalizedRelayHints(decoded.data.relays ?? []),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+export function parseSourceFromSearch(search: string): SourceId | undefined {
+  return search === "" ? undefined : undefined;
+}
+
+export function parseFallbackLabelFromSearch(
+  search: string
+): string | undefined {
   const params = new URLSearchParams(search);
-  const author = params.get("author");
-  return author ? (author as PublicKey) : undefined;
+  const fallbackLabel = params.get("label");
+  return fallbackLabel || undefined;
+}
+
+export function parseAtFromSearch(search: string): ID | undefined {
+  const params = new URLSearchParams(search);
+  const at = params.get("at");
+  return at || undefined;
+}
+
+export function parseStorageKeyFromHash(hash: string): string | undefined {
+  const match = hash.match(/^#key=(.+)$/u);
+  return match ? decodeURIComponent(match[1]) : undefined;
+}
+
+export function buildShareRouteUrl(
+  author: SourceId,
+  docId: string,
+  storageKey: string,
+  relays: readonly string[]
+): string {
+  const rawCoordinate = storageCoordinate(author, docId);
+  const coordinate = rawCoordinate
+    ? { ...rawCoordinate, relays: normalizedRelayHints(relays) }
+    : undefined;
+  if (!coordinate) {
+    return `/local/d/${encodeURIComponent(docId)}#key=${encodeURIComponent(
+      storageKey
+    )}`;
+  }
+  return buildCoordinateRouteUrl("storage", coordinate, undefined, storageKey);
 }

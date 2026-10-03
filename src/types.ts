@@ -1,8 +1,8 @@
 import { Map, OrderedMap, List, OrderedSet, Set } from "immutable";
 import { Event, EventTemplate, UnsignedEvent } from "nostr-tools";
-// eslint-disable-next-line import/no-unresolved
-import { RelayInformation } from "nostr-tools/lib/types/nip11";
 import { QueueStatus } from "./infra/nostr/cache/PublishQueue";
+import { Document as DocumentType } from "./core/Document";
+import type { AddToParentTarget } from "./core/plan";
 
 declare global {
   type Children = {
@@ -11,19 +11,7 @@ declare global {
 
   type PublicKey = string & { readonly "": unique symbol };
 
-  type Relay = {
-    url: string;
-    read: boolean;
-    write: boolean;
-  };
-
-  type SuggestedRelay = Relay & {
-    numberOfContacts: number;
-  };
-
-  type Relays = Array<Relay>;
-
-  type SuggestedRelays = Array<SuggestedRelay>;
+  type FrontMatter = Record<string, unknown>;
 
   type NotificationMessage = {
     title: string;
@@ -58,11 +46,18 @@ declare global {
   export type Nostr = {
     getPublicKey: () => Promise<PublicKey>;
     signEvent: (event: EventTemplate) => Promise<Event>;
+    // NIP-07 optional capability, required by knowstr: storage encryption
+    // wraps per-document keys via nip44 self-encryption.
+    nip44: {
+      encrypt: (pubkey: string, plaintext: string) => Promise<string>;
+      decrypt: (pubkey: string, ciphertext: string) => Promise<string>;
+    };
   };
 
   type DesktopShellBridge = {
     isElectron: boolean;
     platform?: string;
+    fetchText?: (url: string) => Promise<string>;
   };
 
   interface Window {
@@ -81,85 +76,91 @@ declare global {
         publicKey: PublicKey;
       };
 
-  export type Contact = {
-    publicKey: PublicKey;
-    mainRelay?: string;
-    userName?: string;
-  };
-
   export type HasPublicKey = {
     publicKey: PublicKey;
   };
 
-  type Contacts = Map<PublicKey, Contact>;
-
-  type KnowledgeDBs = Map<PublicKey, KnowledgeData>;
-
-  type SnapshotNodes = Map<string, Map<string, GraphNode>>;
+  type KnowledgeDBs = Map<SourceId, KnowledgeData>;
 
   type LocationState = {
     referrer?: string;
   };
 
-  type WriteRelayConf = {
-    defaultRelays?: boolean;
-    user?: boolean;
-    contacts?: boolean;
-    extraRelays?: Relays;
-  };
+  type PublicationRoute =
+    | { kind: "configuration"; relays: string[] }
+    | { kind: "storage" }
+    | { kind: "shared" };
 
   type EventAttachment = {
-    writeRelayConf?: WriteRelayConf;
+    route: PublicationRoute;
+    storageKey?: string;
   };
 
   type TemporaryEvent =
     | {
         type: "ADD_EMPTY_NODE";
-        nodeID: LongID;
+        nodeID: ID;
         index: number;
         nodeItem: GraphNode;
         paneIndex: number;
       }
-    | { type: "REMOVE_EMPTY_NODE"; nodeID: LongID };
+    | { type: "REMOVE_EMPTY_NODE"; nodeID: ID };
 
   type EventState = PublishEvents<EventAttachment> & {
-    preLoginEvents: List<UnsignedEvent & EventAttachment>;
     temporaryView: TemporaryViewState;
     temporaryEvents: List<TemporaryEvent>;
     queueStatus?: QueueStatus;
   };
 
-  type AllRelays = {
-    defaultRelays: Relays;
-    userRelays: Relays;
-    contactsRelays: Relays;
+  type RouteCoordinate = {
+    eventKind: 34774 | 34775;
+    pubkey: PublicKey;
+    dTag: string;
+    relays: string[];
   };
+
+  type PaneSource =
+    | { kind: "local" }
+    | { kind: "storage"; coordinate: RouteCoordinate; storageKey: string }
+    | { kind: "deposit"; coordinate: RouteCoordinate };
+
+  type PaneTarget =
+    | { kind: "home" }
+    | { kind: "node"; nodeId: ID; label?: string }
+    | { kind: "document"; docId: string }
+    | { kind: "source-document" }
+    | { kind: "search"; query: string; resultIds: ID[] };
 
   type Pane = {
     id: string;
-    stack: ID[];
-    author: PublicKey;
+    sourceId: SourceId;
+    routeCoordinate?: RouteCoordinate;
+    documentId?: string;
     rootNodeId?: ID;
+    // Capability from a share link (#key= fragment): the storage key that
+    // opens the pane's encrypted foreign document.
+    storageKey?: string;
+    fallbackLabel?: string;
     searchQuery?: string;
-    typeFilters?: (
-      | Relevance
-      | "suggestions"
-      | "versions"
-      | "incoming"
-      | "contains"
-    )[];
+    searchResultIDs?: ID[];
+    typeFilters?: (Relevance | "incoming" | "contains")[];
     scrollToId?: string;
   };
 
+  type PullOverlayData = {
+    matchedSourceIdsByPaneId: ReadonlyMap<string, readonly SourceId[]>;
+    coordinatesBySourceId: ReadonlyMap<SourceId, RouteCoordinate>;
+  };
+
   type Data = {
-    contacts: Contacts;
-    user: User;
-    contactsRelays: Map<PublicKey, Relays>;
+    user: User | undefined;
     knowledgeDBs: KnowledgeDBs;
-    snapshotNodes: SnapshotNodes;
-    semanticIndex: SemanticIndex;
-    relaysInfos: Map<string, RelayInformation | undefined>;
+    graphIndex: GraphIndex;
+    documents: Map<string, DocumentType>;
+    documentByFilePath: Map<string, DocumentType>;
     publishEventsStatus: EventState;
+    computedNodes: Map<ID, GraphNode>;
+    pull?: PullOverlayData;
 
     views: Views;
     panes: Pane[];
@@ -171,25 +172,73 @@ declare global {
     deleteLocalStorage: (key: string) => void;
   };
 
-  type CompressedSettings = {
-    v: string;
-    n: Buffer;
-  };
-
-  type CompressedSettingsFromStore = {
-    v: string;
-    n: string;
-  };
-
   type Hash = string;
   type ID = string;
-  type LongID = string;
+  type SourceId = string;
+
+  type NodeRef = {
+    sourceId: SourceId;
+    id: ID;
+  };
+
+  type Row = {
+    viewPath: readonly [number, ...ID[]];
+    viewKey: string;
+    index: number;
+    depth: number;
+    node: GraphNode;
+    sourceId: SourceId;
+    ref: NodeRef;
+    view: View;
+    parentViewPath: readonly [number, ...ID[]] | undefined;
+    parentRef: NodeRef | undefined;
+    parentNode: GraphNode | undefined;
+    parentChildIndex: number | undefined;
+    childIndex: number | undefined;
+    hasChildren: boolean;
+    provenance?: {
+      kind: "incoming";
+      sourceId: SourceId;
+    };
+    // The materialization recipe (idea.md: write gestures take first).
+    // Plain data attached by the row's producer: nearest-first anchors,
+    // optionally a prepared take (references enter as references) and
+    // judgment defaults inherited from the proposal's source. Present =
+    // the row is computed and a write gesture must materialize it first.
+    materialize?: {
+      precededBy: ID[];
+      take?: AddToParentTarget;
+      defaults?: { relevance?: Relevance; argument?: Argument };
+      host?: Pick<Row, "node" | "parentRef" | "materialize">;
+      root?: true;
+    };
+    standsFor?: { id: ID };
+    presentedSpans?: InlineSpan[];
+    cycle?: true;
+    dangling?: true;
+    demoted?: true;
+    // Projected embed content: the target's rows rendered at a placement.
+    // Readonly in this step — touches materialize diffs in a later one.
+    projected?: true;
+    isFirstVirtual: boolean;
+    virtualType: "search" | "incoming" | undefined;
+    reference:
+      | {
+          id: ID;
+          sourceId: SourceId;
+          text: string;
+          contextLabels: string[];
+          targetLabel: string;
+          incomingRelevance?: Relevance;
+          incomingArgument?: Argument;
+          displayAs?: "incoming";
+        }
+      | undefined;
+  };
 
   type View = {
     expanded?: boolean;
-    typeFilters?: Array<
-      Relevance | "suggestions" | "versions" | "incoming" | "contains"
-    >;
+    typeFilters?: Array<Relevance | "incoming" | "contains">;
   };
 
   // Context is the path of ancestor node IDs leading to the head node
@@ -208,69 +257,28 @@ declare global {
   // Argument types (evidence) for node children
   type Argument = "confirms" | "contra" | undefined;
 
-  // Each item in a node has relevance and optional argument
-  type VirtualType = "suggestion" | "search" | "incoming" | "version";
-
-  type VersionMeta = {
-    updated: number;
-    addCount: number;
-    removeCount: number;
-  };
-
-  type RootAnchor = {
-    snapshotContext: Context;
-    snapshotLabels?: string[];
-    sourceAuthor?: PublicKey;
-    sourceRootID?: ID;
-    sourceNodeID?: ID;
-    sourceParentNodeID?: ID;
-  };
-
   type RootSystemRole = "log";
+
+  type InlineSpan =
+    | { kind: "text"; text: string }
+    | { kind: "link"; href: string; text: string };
 
   type GraphNode = {
     children: List<ID>;
     id: ID;
-    text: string;
-    frontMatter?: string;
+    spans: InlineSpan[];
     docId?: string;
-    parent?: LongID;
-    anchor?: RootAnchor;
+    parent?: ID;
     systemRole?: RootSystemRole;
-    userPublicKey?: PublicKey;
-    snapshotDTag?: string;
     updated: number;
-    author: PublicKey;
-    basedOn?: LongID;
     root: ID;
     relevance: Relevance;
     argument?: Argument;
-    virtualType?: VirtualType;
-    versionMeta?: VersionMeta;
-    isRef?: boolean;
-    isCref?: boolean;
-    targetID?: LongID;
-    linkText?: string;
     blockKind?: "heading" | "list_item" | "paragraph";
     headingLevel?: number;
     listOrdered?: boolean;
     listStart?: number;
-  };
-
-  // Pure View layer type representing a ref row in the UI, derived from GraphNode but with additional display-related fields
-  type ReferenceRow = {
-    id: ID;
-    type: "reference";
-    text: string;
-    targetContext: Context;
-    contextLabels: string[];
-    targetLabel: string;
-    author: PublicKey;
-    incomingRelevance?: Relevance;
-    incomingArgument?: Argument;
-    displayAs?: "bidirectional" | "incoming";
-    versionMeta?: VersionMeta;
-    deleted?: boolean;
+    extraAttrs?: Record<string, string>;
   };
 
   type Views = Map<string, View>;
@@ -286,11 +294,13 @@ declare global {
     nodes: Map<ID, GraphNode>;
   };
 
-  type SemanticIndex = {
-    nodeByID: globalThis.Map<LongID, GraphNode>;
-    semantic: globalThis.Map<string, globalThis.Set<LongID>>;
-    incomingCrefs: globalThis.Map<LongID, globalThis.Set<LongID>>;
-    basedOnIndex: globalThis.Map<LongID, globalThis.Set<LongID>>;
+  type GraphIndex = {
+    nodeByID: globalThis.Map<ID, GraphNode>;
+    nodesBySource: globalThis.Map<SourceId, globalThis.Map<ID, GraphNode>>;
+    sourceCandidatesById: globalThis.Map<ID, NodeRef[]>;
+    incomingCrefs: globalThis.Map<ID, NodeRef[]>;
+    incomingCrefsByTarget: globalThis.Map<string, NodeRef[]>;
+    incomingFileLinks: globalThis.Map<string, NodeRef[]>;
   };
 
   // Temporary UI state (not persisted to Nostr)

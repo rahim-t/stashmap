@@ -1,7 +1,6 @@
 import { Dispatch, SetStateAction, useEffect, useRef, useState } from "react";
 import { List, Map, Set, OrderedSet } from "immutable";
-import { UNAUTHENTICATED_USER_PK } from "./NostrAuthContext";
-import { splitID } from "./connections";
+import { LOCAL } from "./core/nodeRef";
 import { generatePaneId } from "./SplitPanesContext";
 import {
   jsonToPanes,
@@ -11,16 +10,19 @@ import {
   viewDataToJSON,
 } from "./serializer";
 import {
-  pathToStack,
+  parseAtFromSearch,
+  parseCoordinateRouteUrl,
+  parseDocumentRouteUrl,
+  parseFallbackLabelFromSearch,
   parseNodeRouteUrl,
-  parseAuthorFromSearch,
+  parseStorageKeyFromHash,
+  resolveAddress,
+  routeCoordinateSourceId,
 } from "./navigationUrl";
-import { replaceUnauthenticatedUser } from "./planner";
 
-export const defaultPane = (author: PublicKey, rootItemID?: ID): Pane => ({
+export const defaultPane = (): Pane => ({
   id: generatePaneId(),
-  stack: rootItemID ? [rootItemID] : [],
-  author,
+  sourceId: LOCAL,
 });
 
 const DEFAULT_TEMPORARY_VIEW: TemporaryViewState = {
@@ -37,7 +39,12 @@ function panesStorageKey(publicKey: PublicKey): string {
   return `stashmap-panes-${publicKey}`;
 }
 
-function loadPanesFromStorage(publicKey: PublicKey): Pane[] | undefined {
+function loadPanesFromStorage(
+  publicKey: PublicKey | undefined
+): Pane[] | undefined {
+  if (publicKey === undefined) {
+    return undefined;
+  }
   try {
     const raw = localStorage.getItem(panesStorageKey(publicKey));
     if (!raw) {
@@ -50,8 +57,11 @@ function loadPanesFromStorage(publicKey: PublicKey): Pane[] | undefined {
   }
 }
 
-function savePanesToStorage(publicKey: PublicKey, panes: Pane[]): void {
-  if (publicKey === UNAUTHENTICATED_USER_PK) {
+function savePanesToStorage(
+  publicKey: PublicKey | undefined,
+  panes: Pane[]
+): void {
+  if (publicKey === undefined) {
     return;
   }
   try {
@@ -69,7 +79,12 @@ function viewsStorageKey(publicKey: PublicKey): string {
   return `stashmap-views-${publicKey}`;
 }
 
-function loadViewsFromStorage(publicKey: PublicKey): Views | undefined {
+function loadViewsFromStorage(
+  publicKey: PublicKey | undefined
+): Views | undefined {
+  if (publicKey === undefined) {
+    return undefined;
+  }
   try {
     const raw = localStorage.getItem(viewsStorageKey(publicKey));
     if (!raw) {
@@ -81,7 +96,13 @@ function loadViewsFromStorage(publicKey: PublicKey): Views | undefined {
   }
 }
 
-function saveViewsToStorage(publicKey: PublicKey, views: Views): void {
+function saveViewsToStorage(
+  publicKey: PublicKey | undefined,
+  views: Views
+): void {
+  if (publicKey === undefined) {
+    return;
+  }
   try {
     localStorage.setItem(
       viewsStorageKey(publicKey),
@@ -92,24 +113,74 @@ function saveViewsToStorage(publicKey: PublicKey, views: Views): void {
   }
 }
 
-function getInitialPanes(publicKey: PublicKey): Pane[] {
-  const nodeID = parseNodeRouteUrl(window.location.pathname);
-  if (nodeID) {
-    const nodeAuthor = splitID(nodeID)[0] || publicKey;
+function getUrlPanes(myPublicKey: PublicKey | undefined): Pane[] | undefined {
+  const localDocumentRoute = parseDocumentRouteUrl(window.location.pathname);
+  if (localDocumentRoute) {
     return [
       {
         id: generatePaneId(),
-        stack: [],
-        author: nodeAuthor,
-        rootNodeId: nodeID,
+        sourceId: LOCAL,
+        documentId: localDocumentRoute.docId,
+        scrollToId: parseAtFromSearch(window.location.search),
       },
     ];
   }
-  const urlStack = pathToStack(window.location.pathname);
-  if (urlStack.length > 0) {
-    const urlAuthor =
-      parseAuthorFromSearch(window.location.search) || publicKey;
-    return [{ id: generatePaneId(), stack: urlStack, author: urlAuthor }];
+  const storageRoute = parseCoordinateRouteUrl(
+    window.location.pathname,
+    "storage"
+  );
+  if (storageRoute) {
+    const storageKey = parseStorageKeyFromHash(window.location.hash);
+    const at = parseAtFromSearch(window.location.search);
+    return [
+      {
+        id: generatePaneId(),
+        sourceId: resolveAddress(storageRoute.pubkey, myPublicKey),
+        routeCoordinate: storageRoute,
+        ...(at === undefined
+          ? { documentId: storageRoute.dTag }
+          : { rootNodeId: at }),
+        ...(storageKey !== undefined && { storageKey }),
+      },
+    ];
+  }
+  const depositRoute = parseCoordinateRouteUrl(
+    window.location.pathname,
+    "deposit"
+  );
+  if (depositRoute) {
+    const at = parseAtFromSearch(window.location.search);
+    return [
+      {
+        id: generatePaneId(),
+        sourceId: routeCoordinateSourceId(depositRoute),
+        routeCoordinate: depositRoute,
+        ...(at === undefined
+          ? { documentId: depositRoute.dTag }
+          : { rootNodeId: at }),
+      },
+    ];
+  }
+  const nodeID = parseNodeRouteUrl(window.location.pathname);
+  if (nodeID) {
+    const fallbackLabel = parseFallbackLabelFromSearch(window.location.search);
+    return [
+      {
+        id: generatePaneId(),
+        sourceId: LOCAL,
+        rootNodeId: nodeID,
+        scrollToId: parseAtFromSearch(window.location.search),
+        ...(fallbackLabel !== undefined && { fallbackLabel }),
+      },
+    ];
+  }
+  return undefined;
+}
+
+function getInitialPanes(publicKey: PublicKey | undefined): Pane[] {
+  const urlPanes = getUrlPanes(publicKey);
+  if (urlPanes) {
+    return urlPanes;
   }
   const historyState = window.history.state as {
     panes?: Pane[];
@@ -121,7 +192,7 @@ function getInitialPanes(publicKey: PublicKey): Pane[] {
   if (stored) {
     return stored;
   }
-  return [defaultPane(publicKey)];
+  return [defaultPane()];
 }
 
 export type UserSessionState = {
@@ -133,8 +204,9 @@ export type UserSessionState = {
   setPublishStatus: Dispatch<SetStateAction<EventState>>;
 };
 
-export function useUserSessionState(user: User): UserSessionState {
-  const myPublicKey = user.publicKey;
+export function useUserSessionState(user: User | undefined): UserSessionState {
+  const myPublicKey = user?.publicKey;
+  const isMountedRef = useRef(false);
   const [panes, setPanes] = useState<Pane[]>(() =>
     getInitialPanes(myPublicKey)
   );
@@ -145,27 +217,35 @@ export function useUserSessionState(user: User): UserSessionState {
     unsignedEvents: List(),
     results: Map(),
     isLoading: false,
-    preLoginEvents: List(),
     temporaryView: DEFAULT_TEMPORARY_VIEW,
     temporaryEvents: List(),
   });
 
+  const initialUrlRouteRef = useRef(getUrlPanes(myPublicKey) !== undefined);
   const initialPublicKeyRef = useRef(myPublicKey);
+  useEffect(() => {
+    // eslint-disable-next-line functional/immutable-data
+    isMountedRef.current = true;
+    return () => {
+      // eslint-disable-next-line functional/immutable-data
+      isMountedRef.current = false;
+    };
+  }, []);
+
   useEffect(() => {
     if (myPublicKey === initialPublicKeyRef.current) {
       return;
     }
-    const savedPanes = loadPanesFromStorage(myPublicKey);
     const savedViews = loadViewsFromStorage(myPublicKey);
-    if (savedPanes) {
-      setPanes(savedPanes);
-    } else {
-      setPanes((current) =>
-        current.map((p) => ({
-          ...p,
-          author: replaceUnauthenticatedUser(p.author, myPublicKey),
-        }))
-      );
+    const urlPanes = initialUrlRouteRef.current
+      ? getUrlPanes(myPublicKey)
+      : undefined;
+    const savedPanes = initialUrlRouteRef.current
+      ? undefined
+      : loadPanesFromStorage(myPublicKey);
+    const nextPanes = urlPanes ?? savedPanes;
+    if (nextPanes) {
+      setPanes(nextPanes);
     }
     if (savedViews) {
       setViews(savedViews);
@@ -173,10 +253,16 @@ export function useUserSessionState(user: User): UserSessionState {
   }, [myPublicKey]);
 
   useEffect(() => {
+    if (!isMountedRef.current) {
+      return;
+    }
     savePanesToStorage(myPublicKey, panes);
   }, [panes, myPublicKey]);
 
   useEffect(() => {
+    if (!isMountedRef.current) {
+      return;
+    }
     saveViewsToStorage(myPublicKey, views);
   }, [views, myPublicKey]);
 

@@ -1,24 +1,36 @@
 import React from "react";
-import { RenderResult } from "@testing-library/react";
+import { RenderResult, screen, within } from "@testing-library/react";
+import { Route, Routes } from "react-router-dom";
 import { nip19 } from "nostr-tools";
 import { FilesystemBackendProvider } from "./infra/filesystem/FilesystemBackendProvider";
+import type { WritePublisher } from "./infra/filesystem/writeSupport";
 import { FilesystemDataProvider } from "./infra/filesystem/FilesystemDataProvider";
 import { FilesystemAppRoot } from "./desktop/FilesystemAppRoot";
 import {
   MockWorkspaceIpc,
   mockWorkspaceIpc,
 } from "./testFixtures/mockWorkspaceIpc";
+import { MockRelayPool, mockRelayPool } from "./nostrMock.test";
 import { loadCliProfile } from "./cli/config";
 import { knowstrInit } from "./testFixtures/workspace";
-import {
-  RootViewOrPaneIsLoading,
-  navigateToNodeViaSearch,
-  renderWithTestData,
-} from "./utils.test";
-import { PaneView } from "./components/Workspace";
+import { navigateToNodeViaSearch, renderWithTestData } from "./utils.test";
+import { SplitPaneLayout } from "./editor/SplitPaneLayout";
+import { RelaysWrapper } from "./editor/Relays";
+import { PaneHistoryProvider } from "./PaneHistoryContext";
+import { EntityLabelProvider } from "./EntityLabelContext";
+import { DND } from "./dnd";
 
 // eslint-disable-next-line @typescript-eslint/no-empty-function
 test.skip("skip", () => {});
+
+/* eslint-disable functional/immutable-data */
+const PENDING_IPCS: MockWorkspaceIpc[] = [];
+
+afterEach(async () => {
+  const pending = PENDING_IPCS.splice(0);
+  await Promise.all(pending.map((ipc) => ipc.dispose()));
+});
+/* eslint-enable functional/immutable-data */
 
 type AppRenderOptions = {
   /**
@@ -31,14 +43,23 @@ type AppRenderOptions = {
    */
   search?: string;
   /**
+   * Initial browser route before mounting the filesystem app.
+   */
+  initialRoute?: string;
+  relayPool?: MockRelayPool;
+  /**
    * Start the app with no workspace selected (the "no workspace" empty state).
    * Tests must drive the pick/create flow via the returned `ipc`.
    */
   empty?: boolean;
+  fetchEntityMetadata?: (url: string) => Promise<Response>;
+  fetchCalendarFeed?: (url: string) => Promise<string>;
+  publisher?: WritePublisher;
 };
 
 type AppRenderResult = RenderResult & {
   ipc: MockWorkspaceIpc;
+  relayPool: MockRelayPool;
   path?: string;
   pubkey?: PublicKey;
   npub?: string;
@@ -49,36 +70,76 @@ export async function renderAppTree(
 ): Promise<AppRenderResult> {
   const path = options.empty ? undefined : options.path ?? knowstrInit().path;
   const ipc = mockWorkspaceIpc(path ?? null);
+  // eslint-disable-next-line functional/immutable-data
+  PENDING_IPCS.push(ipc);
+  const relayPool = options.relayPool ?? mockRelayPool();
 
   const utils = renderWithTestData(
     <FilesystemAppRoot>
-      <RootViewOrPaneIsLoading>
-        <PaneView />
-      </RootViewOrPaneIsLoading>
+      <Routes>
+        <Route path="/relays" element={<RelaysWrapper />} />
+        <Route
+          path="*"
+          element={
+            <EntityLabelProvider>
+              <DND>
+                <PaneHistoryProvider>
+                  <SplitPaneLayout />
+                </PaneHistoryProvider>
+              </DND>
+            </EntityLabelProvider>
+          }
+        />
+      </Routes>
     </FilesystemAppRoot>,
     {
       BackendProvider: ({ children }) => (
-        <FilesystemBackendProvider ipc={ipc}>
+        <FilesystemBackendProvider
+          ipc={ipc}
+          pool={{
+            subscribe: (relays, filters, params) =>
+              relayPool.subscribeMany(relays, filters, params),
+            publish: (relays, event) => relayPool.publish(relays, event),
+          }}
+          publisher={options.publisher}
+        >
           {children}
         </FilesystemBackendProvider>
       ),
       DataProvider: FilesystemDataProvider,
+      initialRoute: options.initialRoute,
+      fetchEntityMetadata: options.fetchEntityMetadata,
+      fetchCalendarFeed: options.fetchCalendarFeed,
     }
   );
 
+  const app = within(utils.container);
   if (path === undefined) {
-    return { ...utils, ipc };
+    await app.findByLabelText("Open Folder as Workspace");
+    return { ...utils, ipc, relayPool };
   }
 
   const profile = loadCliProfile({ cwd: path });
+  if (options.initialRoute === "/relays") {
+    await screen.findByText("Workspace Settings");
+  } else {
+    await app.findByLabelText("Search to change pane 0 content");
+  }
   if (options.search) {
-    await navigateToNodeViaSearch(0, options.search);
+    await navigateToNodeViaSearch(0, options.search, {
+      waitForFullscreen: true,
+    });
   }
   return {
     ...utils,
     ipc,
+    relayPool,
     path,
-    pubkey: profile.pubkey,
-    npub: nip19.npubEncode(profile.pubkey),
+    ...(profile.pubkey
+      ? {
+          pubkey: profile.pubkey,
+          npub: nip19.npubEncode(profile.pubkey),
+        }
+      : {}),
   };
 }

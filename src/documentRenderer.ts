@@ -1,13 +1,6 @@
-import {
-  EMPTY_SEMANTIC_ID,
-  getNode,
-  getNodeContext,
-  getNodeText,
-  getSemanticID,
-  isRefNode,
-  shortID,
-} from "./connections";
-import { buildOutgoingReference } from "./buildReferenceRow";
+import { EMPTY_NODE_ID, getNode } from "./core/connections";
+import type { Document } from "./core/Document";
+import { spansToMarkdown } from "./core/nodeSpans";
 import {
   addBlankLinesAroundHeadings,
   formatBulletLine,
@@ -15,79 +8,69 @@ import {
   formatNodeAttrs,
   formatOrderedLine,
   formatPrefixMarkers,
-  formatRootHeading,
   formatWithFrontMatter,
 } from "./documentFormat";
-import { createRootAnchor } from "./rootAnchor";
 
 type SerializeResult = {
   lines: string[];
 };
-
-function getSerializableNodeText(
-  knowledgeDBs: KnowledgeDBs,
-  node: GraphNode
-): string {
-  return getNodeText(node) || shortID(getSemanticID(knowledgeDBs, node));
-}
 
 type SerializeReduceState = SerializeResult & {
   orderedCount: number;
   promoteToHeadingLevel?: number;
 };
 
-function serializeNodeItems(
+function getSerializableNodeBody(node: GraphNode): string | undefined {
+  const body = spansToMarkdown(node.spans);
+  return body === "" ? undefined : body;
+}
+
+function getSerializableNodeAttrs(node: GraphNode): string {
+  return formatNodeAttrs(node.id, {
+    ...(node.extraAttrs ? { extraAttrs: node.extraAttrs } : {}),
+  });
+}
+
+function serializeNodeSequence(
   knowledgeDBs: KnowledgeDBs,
-  author: PublicKey,
-  children: GraphNode["children"],
+  author: SourceId,
+  nodes: readonly GraphNode[],
   indent: string,
   current: SerializeResult
 ): SerializeResult {
-  const result = children.reduce<SerializeReduceState>(
-    (acc, childID) => {
-      if (childID === EMPTY_SEMANTIC_ID) {
+  const serializeChildren = (
+    children: GraphNode["children"],
+    childIndent: string,
+    next: SerializeResult
+  ): SerializeResult => {
+    const childNodes = children
+      .filter((childID) => childID !== EMPTY_NODE_ID)
+      .map((childID) => {
+        const child = getNode(knowledgeDBs, childID, author);
+        if (!child) {
+          throw new Error(`Missing child node: ${childID}`);
+        }
+        return child;
+      })
+      .toArray();
+    return serializeNodeSequence(
+      knowledgeDBs,
+      author,
+      childNodes,
+      childIndent,
+      next
+    );
+  };
+
+  const result = nodes.reduce<SerializeReduceState>(
+    (acc, item) => {
+      const resolvedChild = item;
+      const text = getSerializableNodeBody(resolvedChild);
+      if (text === undefined) {
         return acc;
       }
-      const item = getNode(knowledgeDBs, childID, author);
-      if (!item) {
-        throw new Error(`Missing child node: ${childID}`);
-      }
-      if (isRefNode(item)) {
-        const targetNodeID = item.targetID;
-        if (!targetNodeID) {
-          return acc;
-        }
-        const ref = buildOutgoingReference(
-          item.id as LongID,
-          knowledgeDBs,
-          author
-        );
-        if (!ref) {
-          return acc;
-        }
-        const linkText = item.linkText || ref.text;
-        const prefix = formatPrefixMarkers(item.relevance, item.argument);
-        const body = `${prefix}[${linkText}](#${targetNodeID})`;
-        const line =
-          acc.promoteToHeadingLevel !== undefined
-            ? `${"#".repeat(acc.promoteToHeadingLevel)} ${body}`
-            : `${indent}- ${body}`;
-        return {
-          ...acc,
-          orderedCount: 0,
-          lines: [...acc.lines, line],
-        };
-      }
-
-      const resolvedChild = item;
-      const text = getSerializableNodeText(knowledgeDBs, resolvedChild);
       const prefix = formatPrefixMarkers(item.relevance, item.argument);
-      const attrs = formatNodeAttrs(shortID(resolvedChild.id), {
-        ...(resolvedChild.basedOn ? { basedOn: resolvedChild.basedOn } : {}),
-        ...(resolvedChild.userPublicKey
-          ? { userPublicKey: resolvedChild.userPublicKey }
-          : {}),
-      });
+      const attrs = getSerializableNodeAttrs(resolvedChild);
 
       if (resolvedChild.blockKind === "heading") {
         const level = resolvedChild.headingLevel ?? 2;
@@ -95,13 +78,7 @@ function serializeNodeItems(
           lines: [...acc.lines, formatHeadingLine(level, prefix, text, attrs)],
         };
         return {
-          ...serializeNodeItems(
-            knowledgeDBs,
-            author,
-            resolvedChild.children,
-            "",
-            next
-          ),
+          ...serializeChildren(resolvedChild.children, "", next),
           orderedCount: 0,
           promoteToHeadingLevel: level,
         };
@@ -112,13 +89,7 @@ function serializeNodeItems(
           lines: [...acc.lines, `${prefix}${text}${attrs}`],
         };
         return {
-          ...serializeNodeItems(
-            knowledgeDBs,
-            author,
-            resolvedChild.children,
-            "",
-            next
-          ),
+          ...serializeChildren(resolvedChild.children, "", next),
           orderedCount: 0,
         };
       }
@@ -132,13 +103,7 @@ function serializeNodeItems(
           ],
         };
         return {
-          ...serializeNodeItems(
-            knowledgeDBs,
-            author,
-            resolvedChild.children,
-            "",
-            next
-          ),
+          ...serializeChildren(resolvedChild.children, "", next),
           orderedCount: 0,
           promoteToHeadingLevel: promotedLevel,
         };
@@ -157,13 +122,7 @@ function serializeNodeItems(
           ],
         };
         return {
-          ...serializeNodeItems(
-            knowledgeDBs,
-            author,
-            resolvedChild.children,
-            childIndent,
-            next
-          ),
+          ...serializeChildren(resolvedChild.children, childIndent, next),
           orderedCount: acc.orderedCount + 1,
         };
       }
@@ -172,13 +131,7 @@ function serializeNodeItems(
         lines: [...acc.lines, formatBulletLine(indent, prefix, text, attrs)],
       };
       return {
-        ...serializeNodeItems(
-          knowledgeDBs,
-          author,
-          resolvedChild.children,
-          `${indent}  `,
-          next
-        ),
+        ...serializeChildren(resolvedChild.children, `${indent}  `, next),
         orderedCount: 0,
       };
     },
@@ -189,32 +142,25 @@ function serializeNodeItems(
 
 export function renderDocumentMarkdown(
   knowledgeDBs: KnowledgeDBs,
-  rootNode: GraphNode,
-  options?: {
-    snapshotDTag?: string;
-  }
+  document: Document
 ): string {
-  const rootText = getSerializableNodeText(knowledgeDBs, rootNode);
-  const rootUuid = shortID(rootNode.id);
-  const serialized = serializeNodeItems(
+  if (document.topNodeShortIds.length === 0) {
+    return formatWithFrontMatter("", document.frontMatter);
+  }
+  const nodes = knowledgeDBs.get(document.sourceId)?.nodes;
+  const topNodes = document.topNodeShortIds
+    .map((topNodeShortId) => nodes?.get(topNodeShortId))
+    .filter((node): node is GraphNode => node !== undefined);
+  if (topNodes.length === 0) {
+    return formatWithFrontMatter("", document.frontMatter);
+  }
+  const serialized = serializeNodeSequence(
     knowledgeDBs,
-    rootNode.author,
-    rootNode.children,
+    document.sourceId,
+    topNodes,
     "",
     { lines: [] }
   );
-  const rootLine = formatRootHeading(
-    rootText,
-    rootUuid,
-    rootNode.basedOn,
-    options?.snapshotDTag ?? rootNode.snapshotDTag,
-    rootNode.anchor ?? createRootAnchor(getNodeContext(knowledgeDBs, rootNode)),
-    rootNode.systemRole
-  );
-  return formatWithFrontMatter(
-    `${addBlankLinesAroundHeadings([rootLine, ...serialized.lines]).join(
-      "\n"
-    )}\n`,
-    rootNode.frontMatter
-  );
+  const markdown = addBlankLinesAroundHeadings(serialized.lines).join("\n");
+  return formatWithFrontMatter(`${markdown}\n`, document.frontMatter);
 }

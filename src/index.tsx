@@ -8,21 +8,19 @@ import "./assets/fonts/nostr/css/nostr.css";
 import "./Workspace.scss";
 import "./App.css";
 import { App } from "./App";
+import { CalendarFeedProvider } from "./CalendarFeedContext";
 import { AuthProvider } from "./AuthProvider";
 import { FilesystemBackendProvider } from "./infra/filesystem/FilesystemBackendProvider";
 import { FilesystemDataProvider } from "./infra/filesystem/FilesystemDataProvider";
-import { NostrBackendProvider } from "./infra/nostr/NostrBackendProvider";
+import { NostrBackendDbProvider } from "./infra/nostr/NostrBackendProvider";
 import { NostrDataProvider } from "./infra/nostr/NostrDataProvider";
 import { NostrProvider } from "./NostrProvider";
-import { UserRelayContextProvider } from "./UserRelayContext";
 import {
   isElectronDesktopShell,
   shouldUseHashRouter,
 } from "./runtimeEnvironment";
 import { electronWorkspaceIpc } from "./infra/filesystem/electronWorkspaceIpc";
 import { FilesystemAppRoot } from "./desktop/FilesystemAppRoot";
-
-const defaultRelayUrls = process.env.DEFAULT_RELAYS?.split(",");
 
 function createFileStore(): LocalStorage {
   return {
@@ -47,13 +45,13 @@ function bootstrap(): void {
         <NostrProvider apis={{ fileStore: createFileStore() }}>
           <FilesystemBackendProvider ipc={ipc}>
             <AuthProvider>
-              <FilesystemAppRoot>
-                <UserRelayContextProvider>
+              <CalendarFeedProvider>
+                <FilesystemAppRoot>
                   <FilesystemDataProvider>
                     <App />
                   </FilesystemDataProvider>
-                </UserRelayContextProvider>
-              </FilesystemAppRoot>
+                </FilesystemAppRoot>
+              </CalendarFeedProvider>
             </AuthProvider>
           </FilesystemBackendProvider>
         </NostrProvider>
@@ -64,15 +62,15 @@ function bootstrap(): void {
   createRoot(root).render(
     <Router>
       <NostrProvider apis={{ fileStore: createFileStore() }}>
-        <NostrBackendProvider defaultRelayUrls={defaultRelayUrls}>
+        <NostrBackendDbProvider>
           <AuthProvider>
-            <UserRelayContextProvider>
+            <CalendarFeedProvider>
               <NostrDataProvider>
                 <App />
               </NostrDataProvider>
-            </UserRelayContextProvider>
+            </CalendarFeedProvider>
           </AuthProvider>
-        </NostrBackendProvider>
+        </NostrBackendDbProvider>
       </NostrProvider>
     </Router>
   );

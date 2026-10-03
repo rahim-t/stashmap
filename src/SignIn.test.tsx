@@ -1,6 +1,5 @@
 import { cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { UNAUTHENTICATED_USER_PK } from "./NostrAuthContext";
 import { renderApp, findNewNodeEditor } from "./utils.test";
 import * as runtimeEnvironment from "./runtimeEnvironment";
 
@@ -148,9 +147,7 @@ test("Logout clears history state and does not save panes for unauthenticated us
   await waitFor(() => {
     expect(window.history.state?.panes).toBeUndefined();
   });
-  expect(
-    localStorage.getItem(`stashmap-panes-${UNAUTHENTICATED_USER_PK}`)
-  ).toBeNull();
+  expect(localStorage.getItem("stashmap-panes-undefined")).toBeNull();
 });
 
 test("Split panes don't persist after logout", async () => {
@@ -187,44 +184,8 @@ test("Split panes don't persist after logout", async () => {
   expect(screen.queryAllByLabelText("collapse Root").length).toBe(0);
 });
 
-test("Sign in persists created Notes", async () => {
-  const view = renderApp({
-    user: undefined,
-    timeToStorePreLoginEvents: 0,
-  });
-  await userEvent.type(await findNewNodeEditor(), "Hello World!{Escape}");
-  await userEvent.click(
-    await screen.findByLabelText("sign in to save changes")
-  );
-  await userEvent.type(
-    await screen.findByPlaceholderText(
-      "nsec, private key or mnemonic (12 words)"
-    ),
-    "7f7ff03d123792d6ac594bfa67bf6d0c0ab55b6b1fdb6249303fe861f1ccba9a{enter}"
-  );
-
-  await screen.findByLabelText("edit Hello World!", undefined, {
-    timeout: 5000,
-  });
-  fireEvent.click(await screen.findByLabelText("open menu"));
-  fireEvent.click(await screen.findByLabelText("logout"));
-  cleanup();
-
-  renderApp({
-    relayPool: view.relayPool,
-    fileStore: view.fileStore,
-    user: undefined,
-  });
-  expect(screen.queryAllByLabelText("edit Hello World!").length).toBe(0);
-
-  await userEvent.click(await screen.findByLabelText("sign in"));
-  await userEvent.type(
-    await screen.findByPlaceholderText(
-      "nsec, private key or mnemonic (12 words)"
-    ),
-    "7f7ff03d123792d6ac594bfa67bf6d0c0ab55b6b1fdb6249303fe861f1ccba9a{enter}"
-  );
-  await screen.findByLabelText("edit Hello World!", undefined, {
-    timeout: 5000,
-  });
+test("Logged out is a read-only viewer without an editor", async () => {
+  renderApp({ user: undefined });
+  await screen.findByLabelText("sign in");
+  expect(screen.queryByLabelText("new node editor")).toBeNull();
 });

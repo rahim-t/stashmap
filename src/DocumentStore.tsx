@@ -1,37 +1,39 @@
 import React from "react";
 import { List, Map as ImmutableMap } from "immutable";
 import { Event, UnsignedEvent } from "nostr-tools";
-import type { StoredSnapshotRecord } from "./infra/nostr/cache/indexedDB";
-import { buildKnowledgeDBFromDocumentNodes } from "./documentMaterialization";
-import { parseDocumentContent } from "./markdownNodes";
+import { LOCAL } from "./core/nodeRef";
 import {
-  toStoredSnapshotRecord,
-  materializeSnapshot,
-} from "./infra/snapshotStore";
+  addNodesToGraphIndex,
+  buildGraphIndexFromDocuments,
+  createEmptyGraphIndex,
+  removeNodesFromGraphIndex,
+} from "./graphIndex";
+import { eventToParsed, eventToDocumentDelete } from "./nostrEvents";
 import {
-  addNodesToSemanticIndex,
-  createEmptySemanticIndex,
-  removeNodesFromSemanticIndex,
-} from "./semanticIndex";
-import { eventToDocument, eventToDocumentDelete } from "./nostrEvents";
-import { Document, DocumentDelete, documentKeyOf } from "./Document";
+  Document,
+  DocumentDelete,
+  ParsedDocument,
+  documentKeyOf,
+  withRealWorldEntitiesForDocuments,
+} from "./core/Document";
+import { newDB } from "./core/knowledge";
 
-export type { Document, DocumentDelete };
+export type { Document, DocumentDelete, ParsedDocument };
 
-type DocumentSnapshot = {
+type DocumentState = {
   documents: ImmutableMap<string, Document>;
+  documentByFilePath: ImmutableMap<string, Document>;
   deletes: ImmutableMap<string, DocumentDelete>;
-  nodesByDocumentKey: ImmutableMap<string, ImmutableMap<string, GraphNode>>;
   knowledgeDBs: KnowledgeDBs;
-  semanticIndex: SemanticIndex;
+  graphIndex: GraphIndex;
 };
 
 type DocumentStoreState = {
   knowledgeDBs: KnowledgeDBs;
-  semanticIndex: SemanticIndex;
-  snapshotNodes: SnapshotNodes;
+  graphIndex: GraphIndex;
   documents: ImmutableMap<string, Document>;
-  upsertDocument: (doc: Document) => void;
+  documentByFilePath: ImmutableMap<string, Document>;
+  upsertDocument: (parsed: ParsedDocument) => void;
   deleteDocument: (del: DocumentDelete) => void;
   addEvents: (events: ImmutableMap<string, Event | UnsignedEvent>) => void;
 };
@@ -40,247 +42,343 @@ const DocumentStoreContext = React.createContext<
   DocumentStoreState | undefined
 >(undefined);
 
-function createEmptySnapshot(): DocumentSnapshot {
+function withRealWorldEntities(state: DocumentState): DocumentState {
+  const derived = withRealWorldEntitiesForDocuments(
+    state.knowledgeDBs,
+    state.documents,
+    state.documentByFilePath
+  );
   return {
-    documents: ImmutableMap<string, Document>(),
-    deletes: ImmutableMap<string, DocumentDelete>(),
-    nodesByDocumentKey: ImmutableMap<string, ImmutableMap<string, GraphNode>>(),
-    knowledgeDBs: ImmutableMap<PublicKey, KnowledgeData>(),
-    semanticIndex: createEmptySemanticIndex(),
+    ...state,
+    documents: derived.documents,
+    documentByFilePath: derived.documentByFilePath,
   };
 }
 
-function parseDocumentNodes(doc: Document): ImmutableMap<string, GraphNode> {
-  return parseDocumentContent({
-    content: doc.content,
-    author: doc.author,
-    docId: doc.docId,
-    updatedMs: doc.updatedMs,
+function createInitialState(
+  records: ReadonlyArray<ParsedDocument>
+): DocumentState {
+  const documents = ImmutableMap<string, Document>(
+    records.map((parsed) => [
+      documentKeyOf(parsed.document.sourceId, parsed.document.docId),
+      parsed.document,
+    ])
+  );
+  const documentByFilePath = records.reduce(
+    (acc, parsed) =>
+      parsed.document.filePath
+        ? acc.set(parsed.document.filePath, parsed.document)
+        : acc,
+    ImmutableMap<string, Document>()
+  );
+  const nodesByDocumentKey = ImmutableMap<
+    string,
+    ImmutableMap<string, GraphNode>
+  >(
+    records.map((parsed) => [
+      documentKeyOf(parsed.document.sourceId, parsed.document.docId),
+      parsed.nodes,
+    ])
+  );
+  const filePathByDocumentKey = ImmutableMap<string, string>(
+    records.flatMap((parsed): [string, string][] =>
+      parsed.document.filePath
+        ? [
+            [
+              documentKeyOf(parsed.document.sourceId, parsed.document.docId),
+              parsed.document.filePath,
+            ],
+          ]
+        : []
+    )
+  );
+  const sourceIdByDocumentKey = ImmutableMap<string, SourceId>(
+    records.map((parsed) => [
+      documentKeyOf(parsed.document.sourceId, parsed.document.docId),
+      parsed.document.sourceId,
+    ])
+  );
+  const knowledgeDBs = records.reduce((acc, parsed) => {
+    const db = acc.get(parsed.document.sourceId) ?? newDB();
+    return acc.set(parsed.document.sourceId, {
+      ...db,
+      nodes: db.nodes.merge(parsed.nodes),
+    });
+  }, ImmutableMap<SourceId, KnowledgeData>());
+  return withRealWorldEntities({
+    documents,
+    documentByFilePath,
+    deletes: ImmutableMap<string, DocumentDelete>(),
+    knowledgeDBs,
+    graphIndex: buildGraphIndexFromDocuments(
+      nodesByDocumentKey,
+      filePathByDocumentKey,
+      sourceIdByDocumentKey
+    ),
   });
 }
 
-function getAuthorDocumentNodes(
-  snapshot: DocumentSnapshot,
-  author: PublicKey
+function nodesForDocument(
+  knowledgeDBs: KnowledgeDBs,
+  document: Document
 ): ImmutableMap<string, GraphNode> {
-  return snapshot.documents.entrySeq().reduce((acc, [key, doc]) => {
-    if (doc.author !== author) {
-      return acc;
-    }
-    return acc.merge(
-      snapshot.nodesByDocumentKey.get(key) || ImmutableMap<string, GraphNode>()
-    );
-  }, ImmutableMap<string, GraphNode>());
+  const nodes = knowledgeDBs.get(document.sourceId)?.nodes;
+  if (!nodes) return ImmutableMap<string, GraphNode>();
+  const topNodeIds = new Set(document.topNodeShortIds);
+  return nodes.filter((node) => topNodeIds.has(node.root));
 }
 
-function rebuildAuthors(
-  snapshot: DocumentSnapshot,
-  authors: ReadonlyArray<PublicKey>
+function withoutDocumentNodes(
+  knowledgeDBs: KnowledgeDBs,
+  document: Document | undefined
 ): KnowledgeDBs {
-  const authorSet = new Set(authors);
-  return [...authorSet].reduce((acc, author) => {
-    const authorNodes = getAuthorDocumentNodes(snapshot, author);
-    const nextKnowledgeDB = buildKnowledgeDBFromDocumentNodes(
-      author,
-      authorNodes
-    );
-    return nextKnowledgeDB
-      ? acc.set(author, nextKnowledgeDB)
-      : acc.remove(author);
-  }, snapshot.knowledgeDBs);
+  if (!document) return knowledgeDBs;
+  const db = knowledgeDBs.get(document.sourceId);
+  if (!db) return knowledgeDBs;
+  const documentNodes = nodesForDocument(knowledgeDBs, document);
+  const filtered = db.nodes.filter((_, nodeId) => !documentNodes.has(nodeId));
+  return filtered.size === 0
+    ? knowledgeDBs.remove(document.sourceId)
+    : knowledgeDBs.set(document.sourceId, { ...db, nodes: filtered });
 }
 
-function applyDocumentToSnapshot(
-  snapshot: DocumentSnapshot,
+function withDocNodes(
+  knowledgeDBs: KnowledgeDBs,
+  author: SourceId,
+  nodes: ImmutableMap<string, GraphNode>
+): KnowledgeDBs {
+  if (nodes.size === 0) return knowledgeDBs;
+  const db = knowledgeDBs.get(author) ?? newDB();
+  return knowledgeDBs.set(author, { ...db, nodes: db.nodes.merge(nodes) });
+}
+
+function withDocumentInFilePathIndex(
+  index: ImmutableMap<string, Document>,
   doc: Document
-): DocumentSnapshot {
-  const key = documentKeyOf(doc.author, doc.docId);
-  const nextNodes = parseDocumentNodes(doc);
-  const existingDocument = snapshot.documents.get(key);
-  const existingDelete = snapshot.deletes.get(key);
-  const existingNodes =
-    snapshot.nodesByDocumentKey.get(key) || ImmutableMap<string, GraphNode>();
+): ImmutableMap<string, Document> {
+  return doc.filePath ? index.set(doc.filePath, doc) : index;
+}
+
+function withoutDocumentInFilePathIndex(
+  index: ImmutableMap<string, Document>,
+  doc: Document | undefined
+): ImmutableMap<string, Document> {
+  if (!doc?.filePath) return index;
+  const current = index.get(doc.filePath);
+  if (current && current.docId === doc.docId) {
+    return index.remove(doc.filePath);
+  }
+  return index;
+}
+
+function applyDocumentToState(
+  state: DocumentState,
+  parsed: ParsedDocument
+): DocumentState {
+  const doc = parsed.document;
+  const key = documentKeyOf(doc.sourceId, doc.docId);
+  const existingDocument = state.documents.get(key);
+  const existingDelete = state.deletes.get(key);
 
   if (existingDelete && existingDelete.deletedAt >= doc.updatedMs) {
-    return snapshot;
+    return state;
   }
   if (existingDocument && existingDocument.updatedMs >= doc.updatedMs) {
-    return snapshot;
+    return state;
   }
 
+  const existingNodes = existingDocument
+    ? nodesForDocument(state.knowledgeDBs, existingDocument)
+    : ImmutableMap<string, GraphNode>();
   const nextDeletes =
     existingDelete && doc.updatedMs > existingDelete.deletedAt
-      ? snapshot.deletes.remove(key)
-      : snapshot.deletes;
+      ? state.deletes.remove(key)
+      : state.deletes;
   const withoutExistingNodes =
-    existingNodes.size > 0
-      ? removeNodesFromSemanticIndex(snapshot.semanticIndex, existingNodes)
-      : snapshot.semanticIndex;
-  const nextSnapshotBase = {
-    ...snapshot,
-    documents: snapshot.documents.set(key, doc),
-    deletes: nextDeletes,
-    nodesByDocumentKey: snapshot.nodesByDocumentKey.set(key, nextNodes),
-    semanticIndex: addNodesToSemanticIndex(withoutExistingNodes, nextNodes),
-  };
-  const knowledgeDBs = rebuildAuthors(nextSnapshotBase, [doc.author]);
+    existingDocument && existingNodes.size > 0
+      ? removeNodesFromGraphIndex(
+          state.graphIndex,
+          existingNodes,
+          existingDocument.filePath,
+          existingDocument.sourceId
+        )
+      : state.graphIndex;
+  const documentByFilePathAfterRemove = withoutDocumentInFilePathIndex(
+    state.documentByFilePath,
+    existingDocument
+  );
+  const knowledgeDBsAfterRemove = withoutDocumentNodes(
+    state.knowledgeDBs,
+    existingDocument
+  );
+  const knowledgeDBs = withDocNodes(
+    knowledgeDBsAfterRemove,
+    doc.sourceId,
+    parsed.nodes
+  );
   return {
-    ...nextSnapshotBase,
+    documents: state.documents.set(key, doc),
+    documentByFilePath: withDocumentInFilePathIndex(
+      documentByFilePathAfterRemove,
+      doc
+    ),
+    deletes: nextDeletes,
     knowledgeDBs,
+    graphIndex: addNodesToGraphIndex(
+      withoutExistingNodes,
+      parsed.nodes,
+      doc.filePath,
+      doc.sourceId
+    ),
   };
 }
 
-function applyDeleteToSnapshot(
-  snapshot: DocumentSnapshot,
+function applyDeleteToState(
+  state: DocumentState,
   deletion: DocumentDelete
-): DocumentSnapshot {
-  const key = documentKeyOf(deletion.author, deletion.docId);
-  const existingDocument = snapshot.documents.get(key);
-  const existingDelete = snapshot.deletes.get(key);
+): DocumentState {
+  const key = documentKeyOf(deletion.sourceId, deletion.docId);
+  const existingDocument = state.documents.get(key);
+  const existingDelete = state.deletes.get(key);
 
   if (existingDelete && existingDelete.deletedAt >= deletion.deletedAt) {
-    return snapshot;
+    return state;
   }
 
-  const nextSnapshot = {
-    ...snapshot,
-    documents:
-      existingDocument && existingDocument.updatedMs <= deletion.deletedAt
-        ? snapshot.documents.remove(key)
-        : snapshot.documents,
-    deletes: snapshot.deletes.set(key, deletion),
-    nodesByDocumentKey:
-      existingDocument && existingDocument.updatedMs <= deletion.deletedAt
-        ? snapshot.nodesByDocumentKey.remove(key)
-        : snapshot.nodesByDocumentKey,
-    semanticIndex:
-      existingDocument && existingDocument.updatedMs <= deletion.deletedAt
-        ? removeNodesFromSemanticIndex(
-            snapshot.semanticIndex,
-            snapshot.nodesByDocumentKey.get(key) ||
-              ImmutableMap<string, GraphNode>()
-          )
-        : snapshot.semanticIndex,
-  };
-  const affectedAuthor = existingDocument?.author || deletion.author;
+  const willDelete =
+    !!existingDocument && existingDocument.updatedMs <= deletion.deletedAt;
+  if (!willDelete) {
+    return { ...state, deletes: state.deletes.set(key, deletion) };
+  }
+  const existingNodes = nodesForDocument(state.knowledgeDBs, existingDocument);
   return {
-    ...nextSnapshot,
-    knowledgeDBs: rebuildAuthors(nextSnapshot, [affectedAuthor]),
+    documents: state.documents.remove(key),
+    documentByFilePath: withoutDocumentInFilePathIndex(
+      state.documentByFilePath,
+      existingDocument
+    ),
+    deletes: state.deletes.set(key, deletion),
+    knowledgeDBs: withoutDocumentNodes(state.knowledgeDBs, existingDocument),
+    graphIndex:
+      existingNodes.size > 0
+        ? removeNodesFromGraphIndex(
+            state.graphIndex,
+            existingNodes,
+            existingDocument.filePath,
+            existingDocument.sourceId
+          )
+        : state.graphIndex,
   };
 }
 
-function applyRecordsToSnapshot(
-  snapshot: DocumentSnapshot,
-  documents: ReadonlyArray<Document>,
+function applyRecordsToState(
+  state: DocumentState,
+  records: ReadonlyArray<ParsedDocument>,
   deletes: ReadonlyArray<DocumentDelete>
-): DocumentSnapshot {
-  const withDocuments = documents.reduce(
-    (acc, doc) => applyDocumentToSnapshot(acc, doc),
-    snapshot
+): DocumentState {
+  const withDocuments = records.reduce(
+    (acc, parsed) => applyDocumentToState(acc, parsed),
+    state
   );
-  return deletes.reduce(
-    (acc, deletion) => applyDeleteToSnapshot(acc, deletion),
+  const withDeletes = deletes.reduce(
+    (acc, deletion) => applyDeleteToState(acc, deletion),
     withDocuments
   );
+  return records.length > 0 || deletes.length > 0
+    ? withRealWorldEntities(withDeletes)
+    : withDeletes;
 }
 
-function eventsToDocuments(events: ReadonlyArray<Event | UnsignedEvent>): {
-  readonly documents: ReadonlyArray<Document>;
+function parsedWithSource(
+  parsed: ParsedDocument,
+  sourceId: SourceId
+): ParsedDocument {
+  return {
+    document: { ...parsed.document, sourceId },
+    nodes: parsed.nodes,
+  };
+}
+
+function eventsToParsed(
+  events: ReadonlyArray<Event | UnsignedEvent>,
+  localPubkey: PublicKey | undefined
+): {
+  readonly records: ReadonlyArray<ParsedDocument>;
   readonly deletes: ReadonlyArray<DocumentDelete>;
 } {
   return {
-    documents: events
-      .map((event) => eventToDocument(event))
-      .filter((doc): doc is Document => doc !== undefined),
+    records: events
+      .map((event) => eventToParsed(event))
+      .filter((parsed): parsed is ParsedDocument => parsed !== undefined)
+      .map((parsed) =>
+        parsed.document.sourceId === localPubkey
+          ? parsedWithSource(parsed, LOCAL)
+          : parsed
+      ),
     deletes: events
       .map((event) => eventToDocumentDelete(event))
-      .filter((del): del is DocumentDelete => del !== undefined),
+      .filter((del): del is DocumentDelete => del !== undefined)
+      .map((del) =>
+        del.sourceId === localPubkey ? { ...del, sourceId: LOCAL } : del
+      ),
   };
 }
 
 export function DocumentStoreProvider({
   children,
+  localPubkey,
   unpublishedEvents = List<UnsignedEvent>(),
+  initialDocuments = [],
 }: {
   children: React.ReactNode;
+  localPubkey: PublicKey | undefined;
   unpublishedEvents?: List<UnsignedEvent>;
+  initialDocuments?: ReadonlyArray<ParsedDocument>;
 }): JSX.Element {
-  const [snapshot, setSnapshot] =
-    React.useState<DocumentSnapshot>(createEmptySnapshot);
-  const [snapshotNodes, setSnapshotNodes] = React.useState<SnapshotNodes>(
-    ImmutableMap()
+  const [storedState, setStoredState] = React.useState<DocumentState>(() =>
+    createInitialState(initialDocuments)
   );
-
-  const upsertDocument = React.useCallback((doc: Document) => {
-    setSnapshot((current) => applyDocumentToSnapshot(current, doc));
+  const upsertDocument = React.useCallback((parsed: ParsedDocument) => {
+    setStoredState((current) => applyDocumentToState(current, parsed));
   }, []);
 
   const deleteDocument = React.useCallback((del: DocumentDelete) => {
-    setSnapshot((current) => applyDeleteToSnapshot(current, del));
+    setStoredState((current) => applyDeleteToState(current, del));
   }, []);
 
   const addEvents = React.useCallback(
     (events: ImmutableMap<string, Event | UnsignedEvent>) => {
       const eventList = events.valueSeq().toArray();
-      const { documents, deletes } = eventsToDocuments(eventList);
+      const { records, deletes } = eventsToParsed(eventList, localPubkey);
 
-      const snapshotRecords = eventList
-        .map((event) => toStoredSnapshotRecord(event))
-        .filter(
-          (record): record is StoredSnapshotRecord => record !== undefined
-        );
-
-      if (snapshotRecords.length > 0) {
-        setSnapshotNodes((prev) =>
-          snapshotRecords.reduce((acc, record) => {
-            if (acc.has(record.dTag)) {
-              return acc;
-            }
-            return acc.set(record.dTag, materializeSnapshot(record));
-          }, prev)
-        );
-      }
-
-      if (documents.length === 0 && deletes.length === 0) {
+      if (records.length === 0 && deletes.length === 0) {
         return;
       }
 
-      setSnapshot((current) =>
-        applyRecordsToSnapshot(current, documents, deletes)
+      setStoredState((current) =>
+        applyRecordsToState(current, records, deletes)
       );
     },
-    []
+    [localPubkey]
   );
 
-  const activeSnapshot = React.useMemo(() => {
+  const activeState = React.useMemo(() => {
     const eventList = unpublishedEvents.toArray();
-    const { documents, deletes } = eventsToDocuments(eventList);
-    return applyRecordsToSnapshot(snapshot, documents, deletes);
-  }, [snapshot, unpublishedEvents]);
-
-  React.useEffect(() => {
-    setSnapshotNodes((prev) =>
-      unpublishedEvents.reduce((acc, event) => {
-        const record = toStoredSnapshotRecord(event);
-        if (!record || acc.has(record.dTag)) {
-          return acc;
-        }
-        return acc.set(record.dTag, materializeSnapshot(record));
-      }, prev)
-    );
-  }, [unpublishedEvents]);
+    const { records, deletes } = eventsToParsed(eventList, localPubkey);
+    return applyRecordsToState(storedState, records, deletes);
+  }, [storedState, unpublishedEvents, localPubkey]);
 
   const contextValue = React.useMemo(
     () => ({
-      knowledgeDBs: activeSnapshot.knowledgeDBs,
-      semanticIndex: activeSnapshot.semanticIndex,
-      snapshotNodes,
-      documents: activeSnapshot.documents,
+      knowledgeDBs: activeState.knowledgeDBs,
+      graphIndex: activeState.graphIndex,
+      documents: activeState.documents,
+      documentByFilePath: activeState.documentByFilePath,
       upsertDocument,
       deleteDocument,
       addEvents,
     }),
-    [activeSnapshot, upsertDocument, deleteDocument, addEvents, snapshotNodes]
+    [activeState, upsertDocument, deleteDocument, addEvents]
   );
 
   return (
@@ -298,16 +396,10 @@ export function useDocumentKnowledgeDBs(): KnowledgeDBs {
   return React.useContext(DocumentStoreContext)?.knowledgeDBs || ImmutableMap();
 }
 
-export function useDocumentSemanticIndex(): SemanticIndex {
+export function useDocumentGraphIndex(): GraphIndex {
   return (
-    React.useContext(DocumentStoreContext)?.semanticIndex ||
-    createEmptySemanticIndex()
-  );
-}
-
-export function useDocumentSnapshotNodes(): SnapshotNodes {
-  return (
-    React.useContext(DocumentStoreContext)?.snapshotNodes || ImmutableMap()
+    React.useContext(DocumentStoreContext)?.graphIndex ||
+    createEmptyGraphIndex()
   );
 }
 
@@ -316,4 +408,12 @@ export function useDocuments(): ImmutableMap<string, Document> {
     React.useContext(DocumentStoreContext)?.documents ||
     ImmutableMap<string, Document>()
   );
+}
+
+export function useDocumentByFilePath(): ImmutableMap<string, Document> {
+  const ctx = React.useContext(DocumentStoreContext);
+  if (!ctx) {
+    throw new Error("useDocumentByFilePath used outside DocumentStoreProvider");
+  }
+  return ctx.documentByFilePath;
 }

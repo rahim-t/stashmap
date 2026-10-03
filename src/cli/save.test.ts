@@ -1,6 +1,7 @@
 /** @jest-environment node */
 
 import fs from "fs";
+import os from "os";
 import path from "path";
 import {
   expectMarkdown,
@@ -9,6 +10,85 @@ import {
   readNodeId,
   write,
 } from "../testFixtures/workspace";
+import { runInitCommand } from "./init";
+
+const saveModes = [
+  { name: "local", args: [] },
+  {
+    name: "shared",
+    args: ["--shared", "--relay", "wss://room.example/"],
+  },
+];
+
+test.each(saveModes)(
+  "save stays local in a $name workspace",
+  async ({ args }) => {
+    const workspaceDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), "knowstr-save-")
+    );
+    runInitCommand(args, workspaceDir);
+    write(workspaceDir, "doc.md", "# Doc\n- one\n");
+
+    const result = await knowstrSave(workspaceDir);
+
+    expect(result.changed_paths).toEqual([path.join(workspaceDir, "doc.md")]);
+    expect(result).toEqual({
+      changed_paths: [path.join(workspaceDir, "doc.md")],
+      warnings: [],
+    });
+    expect(fs.readdirSync(workspaceDir).toSorted()).toEqual(
+      args.length === 0 ? ["doc.md"] : [".knowstr", "doc.md"]
+    );
+  }
+);
+
+test("shared save reports document-shape lints without rejecting", async () => {
+  const { path: workspaceDir } = knowstrInit();
+  write(
+    workspaceDir,
+    "asset.md",
+    [
+      "---",
+      "knowstr_doc_id: asset-entry",
+      "---",
+      "# Asset <!-- id:asset:contract -->",
+      "# Extra <!-- id:extra -->",
+      "",
+    ].join("\n")
+  );
+  write(
+    workspaceDir,
+    "arrangement.md",
+    [
+      "---",
+      "knowstr_doc_id: arr:source",
+      "---",
+      '- [Wrong](#other) <!-- id:a1 embed="true" -->',
+      "",
+    ].join("\n")
+  );
+
+  const result = await knowstrSave(workspaceDir);
+
+  expect(result.warnings).toEqual([
+    "arrangement.md: arr:source must have one root embedding source",
+    "asset.md: asset entry documents need exactly one asset root",
+  ]);
+  expect(result.changed_paths).toHaveLength(2);
+});
+
+test("save rejects an organic document id using the arrangement prefix", async () => {
+  const { path: workspaceDir } = knowstrInit();
+  write(
+    workspaceDir,
+    "organic.md",
+    "---\nknowstr_doc_id: arr:reserved\n---\n# Organic <!-- id:root -->\n"
+  );
+
+  await expect(knowstrSave(workspaceDir)).rejects.toThrow(
+    "arr: is reserved for arrangement documents"
+  );
+});
 
 test("save assigns knowstr_doc_id and node ids in place", async () => {
   const { path: workspaceDir } = knowstrInit();
@@ -55,6 +135,8 @@ title: "Doc"
 custom: yes
 ---
 
+# Doc
+
 - one
 `
   );
@@ -62,7 +144,7 @@ custom: yes
   await knowstrSave(workspaceDir);
 
   const raw = fs.readFileSync(path.join(workspaceDir, "doc.md"), "utf8");
-  expect(raw).toContain('title: "Doc"');
+  expect(raw).toContain("title: Doc");
   expect(raw).toContain("custom: yes");
   expect(raw).toContain("knowstr_doc_id:");
   await expectMarkdown(
@@ -73,6 +155,61 @@ custom: yes
 
 - one <!-- id:... -->
 `
+  );
+});
+
+test("save names the source of a generated view in its editing hint", async () => {
+  const { path: workspaceDir } = knowstrInit();
+  write(
+    workspaceDir,
+    "view.md",
+    `---
+generated_from: scripts/render-views.py
+---
+
+# View
+
+- one
+`
+  );
+
+  await knowstrSave(workspaceDir);
+  const second = await knowstrSave(workspaceDir);
+
+  const raw = fs.readFileSync(path.join(workspaceDir, "view.md"), "utf8");
+  expect(raw).toContain("generated_from: scripts/render-views.py");
+  expect(raw).toContain(
+    "editing: |\n  Generated view from scripts/render-views.py; edit the source there and regenerate.\n"
+  );
+  expect(raw).not.toContain("knowstr save will reject");
+  expect(second.changed_paths).toEqual([]);
+});
+
+test("save round-trips knowstr_vote_id frontmatter unchanged", async () => {
+  const { path: workspaceDir } = knowstrInit();
+  write(
+    workspaceDir,
+    "doc.md",
+    `---
+title: "Doc"
+knowstr_vote_id: vote-abc-123
+---
+
+# Doc
+
+- one
+`
+  );
+
+  await knowstrSave(workspaceDir);
+
+  const raw = fs.readFileSync(path.join(workspaceDir, "doc.md"), "utf8");
+  expect(raw).toContain("knowstr_vote_id: vote-abc-123");
+
+  const second = await knowstrSave(workspaceDir);
+  expect(second.changed_paths).toEqual([]);
+  expect(fs.readFileSync(path.join(workspaceDir, "doc.md"), "utf8")).toContain(
+    "knowstr_vote_id: vote-abc-123"
   );
 });
 
@@ -91,7 +228,7 @@ title: "Doc"
 
   await knowstrSave(workspaceDir);
   const raw = fs.readFileSync(path.join(workspaceDir, "doc.md"), "utf8");
-  expect(raw).toMatch(/\n---\n\n# /u);
+  expect(raw).toMatch(/\n---\n\n- /u);
 
   const second = await knowstrSave(workspaceDir);
   expect(second.changed_paths).toEqual([]);
@@ -223,7 +360,98 @@ test("save rejects duplicate node ids across documents", async () => {
   fs.appendFileSync(path.join(workspaceDir, "b.md"), `${itemOneLine}\n`);
 
   await expect(knowstrSave(workspaceDir)).rejects.toMatchObject({
-    message: expect.stringContaining("Workspace contains duplicate node ids"),
+    message: expect.stringMatching(
+      /a\.md and b\.md both contain id:.+\n {2}- if a file is a variant, give it fresh IDs\n {2}- if it's a backup, move it out or add it to \.knowstrignore/u
+    ),
+  });
+});
+
+test("save reports every duplicate node id with its file paths", async () => {
+  const { path: workspaceDir } = knowstrInit();
+  write(workspaceDir, "a.md", "# Alpha\n- item one\n- item two\n");
+  await knowstrSave(workspaceDir);
+
+  const lines = fs
+    .readFileSync(path.join(workspaceDir, "a.md"), "utf8")
+    .split("\n");
+  const itemOneLine = lines.find((l) => l.includes("- item one")) as string;
+  const itemTwoLine = lines.find((l) => l.includes("- item two")) as string;
+
+  write(workspaceDir, "b.md", `# Beta\n${itemOneLine}\n`);
+  write(workspaceDir, "c.md", `# Gamma\n${itemTwoLine}\n`);
+
+  const error = await knowstrSave(workspaceDir).then(
+    () => undefined,
+    (reason: Error) => reason
+  );
+  if (!error) {
+    throw new Error("save should have rejected duplicate node ids");
+  }
+  expect(error.message).toMatch(/a\.md and b\.md both contain id:/u);
+  expect(error.message).toMatch(/a\.md and c\.md both contain id:/u);
+});
+
+test("save rejects a node id repeated within one file", async () => {
+  const { path: workspaceDir } = knowstrInit();
+  write(workspaceDir, "a.md", "# Alpha\n- item one\n");
+  await knowstrSave(workspaceDir);
+
+  const itemOneLine = fs
+    .readFileSync(path.join(workspaceDir, "a.md"), "utf8")
+    .split("\n")
+    .find((l) => l.includes("- item one")) as string;
+  fs.appendFileSync(path.join(workspaceDir, "a.md"), `${itemOneLine}\n`);
+
+  await expect(knowstrSave(workspaceDir)).rejects.toMatchObject({
+    message: expect.stringMatching(/a\.md contains id:.+ more than once/u),
+  });
+});
+
+test("save preserves arbitrary legacy node attributes", async () => {
+  const { path: workspaceDir } = knowstrInit();
+  write(
+    workspaceDir,
+    "a.md",
+    '# Alpha\n- item one <!-- id:n1 basedOn="n0" snapshot="not-a-snapshot" -->\n'
+  );
+
+  await knowstrSave(workspaceDir);
+
+  const raw = fs.readFileSync(path.join(workspaceDir, "a.md"), "utf8");
+  expect(raw).toContain('basedOn="n0" snapshot="not-a-snapshot"');
+});
+
+test("save preserves safe explicit markdown ids exactly", async () => {
+  const { path: workspaceDir } = knowstrInit();
+  write(
+    workspaceDir,
+    "custom-ids.md",
+    [
+      "# Project <!-- id:foo_bar -->",
+      "- dash <!-- id:foo-bar -->",
+      "- colon <!-- id:foo:bar -->",
+      "- dot <!-- id:custom.id -->",
+      "",
+    ].join("\n")
+  );
+
+  await knowstrSave(workspaceDir);
+
+  expect(readNodeId(workspaceDir, "custom-ids.md", "# Project")).toBe(
+    "foo_bar"
+  );
+  expect(readNodeId(workspaceDir, "custom-ids.md", "- dash")).toBe("foo-bar");
+  expect(readNodeId(workspaceDir, "custom-ids.md", "- colon")).toBe("foo:bar");
+  expect(readNodeId(workspaceDir, "custom-ids.md", "- dot")).toBe("custom.id");
+  expect((await knowstrSave(workspaceDir)).changed_paths).toEqual([]);
+});
+
+test("save rejects unsafe explicit markdown ids", async () => {
+  const { path: workspaceDir } = knowstrInit();
+  write(workspaceDir, "bad-id.md", '# Bad <!-- id:bad"id -->\n');
+
+  await expect(knowstrSave(workspaceDir)).rejects.toMatchObject({
+    message: expect.stringContaining('Invalid markdown node id: bad"id'),
   });
 });
 
@@ -498,6 +726,35 @@ test("save round-trips combined prefix markers like (-!) and (-~)", async () => 
   expect((await knowstrSave(workspaceDir)).changed_paths).toEqual([]);
 });
 
+test("save preserves prefix markers on paragraphs", async () => {
+  const { path: workspaceDir } = knowstrInit();
+  write(
+    workspaceDir,
+    "paragraph-markers.md",
+    `
+# Project
+
+(-!) paragraph contra relevant
+
+(+) paragraph confirms
+`
+  );
+
+  await knowstrSave(workspaceDir);
+  await expectMarkdown(
+    workspaceDir,
+    "paragraph-markers.md",
+    `
+# Project <!-- id:... -->
+
+(-!) paragraph contra relevant <!-- id:... -->
+
+(+) paragraph confirms <!-- id:... -->
+`
+  );
+  expect((await knowstrSave(workspaceDir)).changed_paths).toEqual([]);
+});
+
 test("save preserves bold and italic emphasis", async () => {
   const { path: workspaceDir } = knowstrInit();
   write(
@@ -571,7 +828,9 @@ test("save still treats whole-line ref-style link as ref node", async () => {
   const linkedLine = second
     .split("\n")
     .find((l) => l.includes(`- [Linked](#${targetId})`)) as string;
-  expect(linkedLine).toBe(`- [Linked](#${targetId})`);
+  expect(linkedLine).toMatch(
+    new RegExp(`^- \\[Linked\\]\\(#${targetId}\\) <!-- id:[^>]+ -->$`, "u")
+  );
   expect((await knowstrSave(workspaceDir)).changed_paths).toEqual([]);
 });
 
@@ -606,7 +865,12 @@ test("save still treats prefixed whole-line ref-style link as ref node", async (
   const linkedLine = second
     .split("\n")
     .find((l) => l.includes(`- (!) [Linked](#${targetId})`)) as string;
-  expect(linkedLine).toBe(`- (!) [Linked](#${targetId})`);
+  expect(linkedLine).toMatch(
+    new RegExp(
+      `^- \\(!\\) \\[Linked\\]\\(#${targetId}\\) <!-- id:[^>]+ -->$`,
+      "u"
+    )
+  );
   expect((await knowstrSave(workspaceDir)).changed_paths).toEqual([]);
 });
 
@@ -639,10 +903,21 @@ test("save treats ref-style link with bracketed text as ref node", async () => {
     path.join(workspaceDir, "bracketed-ref.md"),
     "utf8"
   );
+  const serializedLinkedText = linkedText.replace(/([\\[\]])/gu, "\\$1");
   const linkedLine = second
     .split("\n")
-    .find((l) => l.includes(`- [${linkedText}](#${targetId})`)) as string;
-  expect(linkedLine).toBe(`- [${linkedText}](#${targetId})`);
+    .find((line) =>
+      line.includes(`- [${serializedLinkedText}](#${targetId})`)
+    ) as string;
+  expect(linkedLine).toMatch(
+    new RegExp(
+      `^- \\[${serializedLinkedText.replace(
+        /[.*+?^${}()|[\]\\]/gu,
+        "\\$&"
+      )}\\]\\(#${targetId}\\) <!-- id:[^>]+ -->$`,
+      "u"
+    )
+  );
   expect((await knowstrSave(workspaceDir)).changed_paths).toEqual([]);
 });
 
@@ -728,7 +1003,7 @@ custom: yes
   await knowstrSave(workspaceDir);
 
   const raw = fs.readFileSync(path.join(workspaceDir, "doc.md"), "utf8");
-  expect(raw).toContain('title: "Doc"');
+  expect(raw).toContain("title: Doc");
   expect(raw).toContain("custom: yes");
   expect(raw).not.toContain("stale instructions");
   expect(raw).not.toContain("second stale line");
@@ -799,20 +1074,35 @@ test("save preserves a trailing inline code span with comment-like content", asy
   expect((await knowstrSave(workspaceDir)).changed_paths).toEqual([]);
 });
 
-test("save ignores the top-level inbox folder", async () => {
+test("save treats the top-level inbox folder as ordinary workspace content", async () => {
   const { path: workspaceDir } = knowstrInit();
-  write(
-    workspaceDir,
-    "inbox/foreign.md",
-    "# Foreign\n- should stay untouched\n"
-  );
+  write(workspaceDir, "inbox/foreign.md", "# Foreign\n- should get ids\n");
   write(workspaceDir, "public.md", "# Public\n- visible\n");
 
   const result = await knowstrSave(workspaceDir);
-  expect(result.changed_paths).toEqual([path.join(workspaceDir, "public.md")]);
-  expect(
-    fs.readFileSync(path.join(workspaceDir, "inbox", "foreign.md"), "utf8")
-  ).toBe("# Foreign\n- should stay untouched\n");
+  expect(result.changed_paths).toEqual([
+    path.join(workspaceDir, "inbox", "foreign.md"),
+    path.join(workspaceDir, "public.md"),
+  ]);
+
+  await expectMarkdown(
+    workspaceDir,
+    "inbox/foreign.md",
+    `
+# Foreign <!-- id:... -->
+
+- should get ids <!-- id:... -->
+`
+  );
+  await expectMarkdown(
+    workspaceDir,
+    "public.md",
+    `
+# Public <!-- id:... -->
+
+- visible <!-- id:... -->
+`
+  );
 });
 
 test(".knowstrignore ignores a directory", async () => {
@@ -910,4 +1200,12 @@ test("save survives an inline code span whose content equals the line's id comme
     .filter((l) => l === collidingLine).length;
   expect(count).toBe(1);
   expect((await knowstrSave(workspaceDir)).changed_paths).toEqual([]);
+});
+
+test("save rejects an unreadable .knowstrignore", async () => {
+  const { path: workspaceDir } = knowstrInit();
+  fs.mkdirSync(path.join(workspaceDir, ".knowstrignore"));
+  write(workspaceDir, "doc.md", "# Doc\n- one\n");
+
+  await expect(knowstrSave(workspaceDir)).rejects.toThrow("EISDIR");
 });

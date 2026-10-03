@@ -1,22 +1,14 @@
-import { getSemanticID, isSearchId, shortID } from "./connections";
+import { getNode, isSearchId } from "./core/connections";
+import { getWorkspaceNode } from "./core/knowledge";
 import { planRemoveNodeItemById } from "./dataPlanner";
 import {
   ViewPath,
-  getContext,
-  getParentView,
   updateViewPathsAfterDisconnect,
-  getNodeIndexForView,
-  getRowIDFromView,
-  getLast,
-  getNodeForView,
-  getPaneIndex,
-  isRoot,
   addNodeToPathWithNodes,
   viewPathToString,
   copyViewsWithNewPrefix,
-} from "./ViewContext";
+} from "./rowModel";
 import {
-  getPane,
   Plan,
   planAddToParent,
   planDeleteNodes,
@@ -31,64 +23,35 @@ function resetInvalidPanes(plan: Plan, paneIndexToReset?: number): Plan {
     if (paneIndexToReset !== undefined && i === paneIndexToReset) {
       return true;
     }
-    if (p.rootNodeId !== undefined) {
-      return (
-        getNodeForView(plan, [i, p.rootNodeId] as ViewPath, p.stack) ===
-        undefined
-      );
-    }
-    if (p.stack.length === 0) {
+    if (!p.rootNodeId) {
       return false;
     }
-    const rootViewPath: ViewPath = [
-      i,
-      p.rootNodeId || p.stack[p.stack.length - 1],
-    ];
-    return getNodeForView(plan, rootViewPath, p.stack) === undefined;
+    return getNode(plan.knowledgeDBs, p.rootNodeId, p.sourceId) === undefined;
   };
 
   const newPanes = plan.panes.map((p, i) =>
-    shouldResetPane(p, i) ? { ...p, stack: [], rootNodeId: undefined } : p
+    shouldResetPane(p, i) ? { ...p, rootNodeId: undefined } : p
   );
   return planUpdatePanes(plan, newPanes);
 }
 
 export function planDisconnectFromParent(
   plan: Plan,
-  viewPath: ViewPath,
-  stack: ID[],
+  parentID: ID,
+  childID: ID,
   preserveDescendants?: boolean
 ): Plan {
-  const parentPath = getParentView(viewPath);
-  if (!parentPath) {
-    return plan;
-  }
-
-  const nodeIndex = getNodeIndexForView(plan, viewPath);
-  if (nodeIndex === undefined) {
-    return plan;
-  }
-
-  const disconnectID = getLast(viewPath);
-  const parentNode = getNodeForView(plan, parentPath, stack);
-  if (!parentNode) {
-    return plan;
-  }
-  if (parentNode.author !== plan.user.publicKey) {
-    return plan;
-  }
-
   const updatedNodesPlan = planRemoveNodeItemById(
     plan,
-    parentNode.id,
-    getLast(viewPath),
+    parentID,
+    childID,
     preserveDescendants === undefined ? false : !!preserveDescendants
   );
 
   const updatedViews = updateViewPathsAfterDisconnect(
     updatedNodesPlan.views,
-    disconnectID,
-    parentNode.id
+    childID,
+    parentID
   );
 
   const planWithViews = planUpdateViews(updatedNodesPlan, updatedViews);
@@ -96,83 +59,70 @@ export function planDisconnectFromParent(
   return resetInvalidPanes(planWithViews);
 }
 
-export function planDeleteNodeFromView(
+export function planDeleteNode(
   plan: Plan,
-  viewPath: ViewPath,
-  stack: ID[]
+  nodeID: ID,
+  parentID: ID | undefined,
+  paneIndex: number
 ): Plan {
-  if (!isRoot(viewPath)) {
-    return planDisconnectFromParent(plan, viewPath, stack);
+  if (parentID) {
+    return planDisconnectFromParent(plan, parentID, nodeID);
   }
 
-  const [itemID] = getRowIDFromView(plan, viewPath);
-  if (isSearchId(itemID as ID)) {
+  if (isSearchId(nodeID)) {
     return plan;
   }
 
-  const node = getNodeForView(plan, viewPath, stack);
-  if (!node || node.author !== plan.user.publicKey) {
+  const node = getWorkspaceNode(plan.knowledgeDBs, nodeID);
+  if (!node) {
     return plan;
   }
 
   const planAfterDescendants = planDeleteDescendantNodes(plan, node);
   const planAfterDelete = planDeleteNodes(planAfterDescendants, node.id);
-  return resetInvalidPanes(planAfterDelete, getPaneIndex(viewPath));
+  return resetInvalidPanes(planAfterDelete, paneIndex);
 }
 
-export function planMoveNodeWithView(
+export function planMoveNode(
   plan: Plan,
+  sourceNodeID: ID,
+  sourceChildID: ID,
+  sourceParentID: ID,
   sourceViewPath: ViewPath,
+  targetParentID: ID,
   targetParentViewPath: ViewPath,
-  stack: ID[],
   insertAtIndex?: number
 ): Plan {
-  const [sourceItemID] = getRowIDFromView(plan, sourceViewPath);
-  const sourceStack = getPane(plan, sourceViewPath).stack;
-  const sourceNode = getNodeForView(plan, sourceViewPath, sourceStack);
-  const sourceAddID = sourceNode?.id ?? sourceItemID;
+  const sourceNode = getWorkspaceNode(plan.knowledgeDBs, sourceNodeID);
+  if (!sourceNode) {
+    return plan;
+  }
 
-  const [planWithAdd, [actualItemID]] = planAddToParent(
+  const [planWithAdd] = planAddToParent(
     plan,
-    sourceAddID,
-    targetParentViewPath,
-    stack,
+    sourceNodeID,
+    targetParentID,
     insertAtIndex
   );
 
-  const moveItemID = actualItemID ?? sourceItemID;
-
-  const targetParentContext = getContext(
-    planWithAdd,
-    targetParentViewPath,
-    stack
-  );
-  const [targetParentRowID] = getRowIDFromView(
-    planWithAdd,
-    targetParentViewPath
-  );
-  const actualTargetParentNode = getNodeForView(
-    planWithAdd,
-    targetParentViewPath,
-    stack
-  );
-  const targetContext = targetParentContext.push(
-    shortID(
-      (actualTargetParentNode
-        ? getSemanticID(planWithAdd.knowledgeDBs, actualTargetParentNode)
-        : targetParentRowID) as ID
-    )
+  const actualTargetParentNode = getWorkspaceNode(
+    planWithAdd.knowledgeDBs,
+    targetParentID
   );
 
-  const nodes = getNodeForView(planWithAdd, targetParentViewPath, stack);
-  if (!nodes || nodes.children.size === 0) {
-    return planDisconnectFromParent(planWithAdd, sourceViewPath, stack, true);
+  if (!actualTargetParentNode || actualTargetParentNode.children.size === 0) {
+    return planDisconnectFromParent(
+      planWithAdd,
+      sourceParentID,
+      sourceChildID,
+      true
+    );
   }
 
-  const targetIndex = insertAtIndex ?? nodes.children.size - 1;
+  const targetIndex = insertAtIndex ?? actualTargetParentNode.children.size - 1;
   const targetViewPath = addNodeToPathWithNodes(
     targetParentViewPath,
-    nodes,
+    actualTargetParentNode,
     targetIndex
   );
 
@@ -193,8 +143,8 @@ export function planMoveNodeWithView(
 
   const disconnectedPlan = planDisconnectFromParent(
     planWithViews,
-    sourceViewPath,
-    stack,
+    sourceParentID,
+    sourceChildID,
     true
   );
   const planWithDisconnect =
@@ -205,16 +155,10 @@ export function planMoveNodeWithView(
         )
       : disconnectedPlan;
 
-  if (!sourceNode) {
-    return planWithDisconnect;
-  }
-
   return planMoveDescendantNodes(
     planWithDisconnect,
     sourceNode,
-    targetContext,
-    actualTargetParentNode?.id,
-    moveItemID !== sourceItemID ? moveItemID : undefined,
-    actualTargetParentNode?.root
+    actualTargetParentNode.id,
+    actualTargetParentNode.root
   );
 }

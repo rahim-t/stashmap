@@ -1,5 +1,5 @@
 import { Map } from "immutable";
-import { parseViewPath } from "./ViewContext";
+import { parseViewPath } from "./rowModel";
 
 export type Serializable =
   | string
@@ -52,7 +52,7 @@ function asArray(obj: Serializable | undefined): Array<Serializable> {
 
 function parseTypeFilter(
   value: string
-): Relevance | "suggestions" | "versions" | "incoming" | "contains" | null {
+): Relevance | "incoming" | "contains" | null {
   if (value === "contains") {
     return "contains";
   }
@@ -67,12 +67,6 @@ function parseTypeFilter(
   ) {
     return value as Relevance;
   }
-  if (value === "suggestions") {
-    return "suggestions";
-  }
-  if (value === "versions") {
-    return "versions";
-  }
   if (value === "incoming") {
     return "incoming";
   }
@@ -81,18 +75,11 @@ function parseTypeFilter(
 
 function parseTypeFilters(
   arr: Array<Serializable>
-): Array<Relevance | "suggestions" | "versions" | "incoming" | "contains"> {
+): Array<Relevance | "incoming" | "contains"> {
   return arr
     .map((item) => parseTypeFilter(asString(item)))
     .filter(
-      (
-        parsed
-      ): parsed is
-        | Relevance
-        | "suggestions"
-        | "versions"
-        | "incoming"
-        | "contains" => parsed !== null
+      (parsed): parsed is Relevance | "incoming" | "contains" => parsed !== null
     );
 }
 
@@ -137,9 +124,12 @@ export function jsonToViews(s: Serializable): Map<string, View> {
 export function paneToJSON(pane: Pane): Serializable {
   return {
     i: pane.id,
-    s: pane.stack,
-    a: pane.author,
+    s: pane.sourceId,
+    d: pane.documentId,
     r: pane.rootNodeId,
+    l: pane.fallbackLabel,
+    h: pane.searchQuery,
+    q: pane.searchResultIDs,
     t: pane.typeFilters,
   };
 }
@@ -151,9 +141,15 @@ function jsonToPane(s: Serializable): Pane | undefined {
   const obj = asObject(s);
   return {
     id: asString(obj.i),
-    stack: asArray(obj.s).map((id) => asString(id) as ID),
-    author: asString(obj.a) as PublicKey,
-    rootNodeId: obj.r !== undefined ? (asString(obj.r) as LongID) : undefined,
+    sourceId: asString(obj.s),
+    documentId: obj.d !== undefined ? asString(obj.d) : undefined,
+    rootNodeId: obj.r !== undefined ? (asString(obj.r) as ID) : undefined,
+    fallbackLabel: obj.l !== undefined ? asString(obj.l) : undefined,
+    searchQuery: obj.h !== undefined ? asString(obj.h) : undefined,
+    searchResultIDs:
+      obj.q !== undefined
+        ? asArray(obj.q).map((id) => asString(id) as ID)
+        : undefined,
     typeFilters:
       obj.t !== undefined
         ? (asArray(obj.t).map((f) => asString(f)) as Pane["typeFilters"])

@@ -1,49 +1,91 @@
-import { UnsignedEvent } from "nostr-tools";
-import { shortID } from "./connections";
-import { renderDocumentMarkdown } from "./documentRenderer";
+import { Event, UnsignedEvent } from "nostr-tools";
+import type { Document } from "./core/Document";
+import { documentAudienceTags } from "./core/Document";
+import { newStorageKey } from "./storageEncryption";
+import { getEventMs } from "./nostrEvents";
 import {
+  KIND_KNOWLEDGE_DEPOSIT,
   KIND_KNOWLEDGE_DOCUMENT,
-  KIND_KNOWLEDGE_DOCUMENT_SNAPSHOT,
   msTag,
   newTimestamp,
 } from "./nostr";
 
 export function buildDocumentEvent(
-  knowledgeDBs: KnowledgeDBs,
-  rootNode: GraphNode,
-  options?: {
-    snapshotDTag?: string;
-  }
-): UnsignedEvent {
-  const docId = rootNode.docId ?? shortID(rootNode.id);
-  const systemRoleTags = rootNode.systemRole
-    ? ([["s", rootNode.systemRole]] as string[][])
+  document: Document,
+  pubkey: PublicKey,
+  content: string
+): UnsignedEvent & EventAttachment {
+  const systemRoleTags: string[][] = document.systemRole
+    ? [["s", document.systemRole]]
     : [];
   return {
     kind: KIND_KNOWLEDGE_DOCUMENT,
-    pubkey: rootNode.author,
+    pubkey,
     created_at: newTimestamp(),
-    tags: [["d", docId], ...systemRoleTags, msTag()],
-    content: renderDocumentMarkdown(knowledgeDBs, rootNode, options),
+    tags: [["d", document.docId], ...systemRoleTags, msTag()],
+    content,
+    route: { kind: "storage" },
+    storageKey: document.storageKey ?? newStorageKey(),
   };
 }
 
-export function buildSnapshotEventFromNodes(
-  knowledgeDBs: KnowledgeDBs,
-  snapshotAuthor: PublicKey,
-  snapshotDTag: string,
-  sourceRootNode: GraphNode
+export function depositEntityTags(document: Document): string[] {
+  return documentAudienceTags(document);
+}
+
+export function buildDepositEvent(
+  document: Document,
+  pubkey: PublicKey,
+  content: string,
+  createdAt: number
 ): UnsignedEvent {
+  if (!Number.isSafeInteger(createdAt) || createdAt < 0) {
+    throw new Error("createdAt must be a non-negative safe integer");
+  }
   return {
-    kind: KIND_KNOWLEDGE_DOCUMENT_SNAPSHOT,
-    pubkey: snapshotAuthor,
-    created_at: newTimestamp(),
+    kind: KIND_KNOWLEDGE_DEPOSIT,
+    pubkey,
+    created_at: createdAt,
     tags: [
-      ["d", snapshotDTag],
-      ["source", shortID(sourceRootNode.id)],
-      ["source_author", sourceRootNode.author],
+      ["d", document.docId],
+      ...depositEntityTags(document).map((tag) => ["S", tag]),
       msTag(),
     ],
-    content: renderDocumentMarkdown(knowledgeDBs, sourceRootNode),
+    content,
   };
+}
+
+function depositOrder(event: Event): [number, number, string] {
+  return [event.created_at, getEventMs(event), event.id];
+}
+
+function isNewerDeposit(candidate: Event, current: Event): boolean {
+  const candidateOrder = depositOrder(candidate);
+  const currentOrder = depositOrder(current);
+  return (
+    candidateOrder[0] > currentOrder[0] ||
+    (candidateOrder[0] === currentOrder[0] &&
+      (candidateOrder[1] > currentOrder[1] ||
+        (candidateOrder[1] === currentOrder[1] &&
+          candidateOrder[2] > currentOrder[2])))
+  );
+}
+
+export function selectLatestDepositEvents(events: readonly Event[]): Event[] {
+  return [
+    ...events
+      .filter((event) => event.kind === KIND_KNOWLEDGE_DEPOSIT)
+      .reduce((latest, event) => {
+        const docId = event.tags.find((tag) => tag[0] === "d")?.[1];
+        if (!docId) {
+          return latest;
+        }
+        const key = `${event.kind}:${event.pubkey}:${docId}`;
+        const current = latest.get(key);
+        return !current || isNewerDeposit(event, current)
+          ? new Map(latest).set(key, event)
+          : latest;
+      }, new Map<string, Event>())
+      .values(),
+  ];
 }

@@ -2,17 +2,19 @@ import { cleanup, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Event } from "nostr-tools";
 import { clearDatabase } from "./infra/nostr/cache/indexedDB";
+import { KIND_DELETE, KIND_KNOWLEDGE_DOCUMENT } from "./nostr";
+import { LOG_ROOT_ROLE } from "./core/systemRoots";
 import {
-  KIND_DELETE,
-  KIND_KNOWLEDGE_DOCUMENT,
-  KIND_KNOWLEDGE_DOCUMENT_SNAPSHOT,
-} from "./nostr";
-import { LOG_ROOT_ROLE } from "./systemRoots";
-import { ALICE, mockRelayPool, renderApp, setup } from "./utils.test";
+  ALICE,
+  encryptStorageEventForTest,
+  mockRelayPool,
+  renderApp,
+  setup,
+} from "./utils.test";
 
 const TEST_RELAY = "wss://relay.test.first.success/";
 
-function createLogDocumentEvent({
+async function createLogDocumentEvent({
   author,
   createdAt,
   rootUuid = "log-root",
@@ -22,8 +24,8 @@ function createLogDocumentEvent({
   createdAt: number;
   rootUuid?: string;
   body?: string;
-}): Event {
-  return {
+}): Promise<Event> {
+  return encryptStorageEventForTest(ALICE, {
     id: `${author.slice(0, 8)}-log-${createdAt}`.padEnd(64, "0"),
     pubkey: author,
     created_at: createdAt,
@@ -34,8 +36,8 @@ function createLogDocumentEvent({
       ["ms", `${createdAt * 1000}`],
       ["s", LOG_ROOT_ROLE],
     ],
-    content: `# ~Log <!-- id:${rootUuid} systemRole="${LOG_ROOT_ROLE}" -->\n${body}`,
-  };
+    content: `# ~Log <!-- id:${rootUuid} -->\n${body}`,
+  });
 }
 
 function createDocumentDeleteEvent({
@@ -122,7 +124,7 @@ describe("permanent live sync integration", () => {
     const relayPool = mockRelayPool();
     relayPool.publish(
       [TEST_RELAY],
-      createLogDocumentEvent({
+      await createLogDocumentEvent({
         author: ALICE.publicKey,
         createdAt: 10,
       })
@@ -139,10 +141,7 @@ describe("permanent live sync integration", () => {
           filters: [
             expect.objectContaining({
               authors: [ALICE.publicKey],
-              kinds: [
-                KIND_KNOWLEDGE_DOCUMENT,
-                KIND_KNOWLEDGE_DOCUMENT_SNAPSHOT,
-              ],
+              kinds: [KIND_KNOWLEDGE_DOCUMENT],
               limit: 0,
             }),
             expect.objectContaining({
@@ -189,7 +188,7 @@ describe("permanent live sync integration", () => {
 
     relayPool.publish(
       [TEST_RELAY],
-      createLogDocumentEvent({
+      await createLogDocumentEvent({
         author: ALICE.publicKey,
         createdAt: 11,
       })
@@ -207,7 +206,7 @@ describe("permanent live sync integration", () => {
 
     relayPool.publish(
       [TEST_RELAY],
-      createLogDocumentEvent({
+      await createLogDocumentEvent({
         author: ALICE.publicKey,
         createdAt: 12,
       })
@@ -232,7 +231,7 @@ describe("permanent live sync integration", () => {
     const relayPool = mockRelayPool();
     relayPool.publish(
       [TEST_RELAY],
-      createLogDocumentEvent({
+      await createLogDocumentEvent({
         author: ALICE.publicKey,
         createdAt: 1_700_000_100,
       })
@@ -251,7 +250,7 @@ describe("permanent live sync integration", () => {
     const relayPool = mockRelayPool();
     relayPool.publish(
       [TEST_RELAY],
-      createLogDocumentEvent({
+      await createLogDocumentEvent({
         author: ALICE.publicKey,
         createdAt: 1_700_000_190,
         body: "- Old Child\n",
@@ -259,7 +258,7 @@ describe("permanent live sync integration", () => {
     );
     relayPool.publish(
       [TEST_RELAY],
-      createLogDocumentEvent({
+      await createLogDocumentEvent({
         author: ALICE.publicKey,
         createdAt: 1_700_000_200,
         body: "- New Child\n",
@@ -277,7 +276,7 @@ describe("permanent live sync integration", () => {
 
   test("duplicate historical and live delivery does not duplicate visible document state", async () => {
     const relayPool = mockRelayPool();
-    const document = createLogDocumentEvent({
+    const document = await createLogDocumentEvent({
       author: ALICE.publicKey,
       createdAt: 1_700_000_200,
       body: "- Once Only\n",

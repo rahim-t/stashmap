@@ -2,24 +2,18 @@ import { useEffect, useMemo } from "react";
 import { Map as ImmutableMap } from "immutable";
 import { Event, UnsignedEvent } from "nostr-tools";
 import { useApis } from "../../../Apis";
+import { useBackend } from "../../../BackendContext";
 import { useData } from "../../../DataContext";
 import { useDocumentStore } from "../../../DocumentStore";
-import { useDefaultRelays } from "../../../NostrAuthContext";
-import { useUserRelayContext } from "../../../UserRelayContext";
-import {
-  flattenRelays,
-  getReadRelays,
-  sanitizeRelays,
-} from "../../../relayUtils";
+import { KIND_KNOWLEDGE_DOCUMENT } from "../../../nostr";
+import { normalizedRelayUrls } from "../../../pullSources";
 import {
   applyStoredDelete,
   applyStoredDocument,
-  buildPermanentSyncAuthors,
   startPermanentDocumentSync,
   toStoredDeleteRecord,
   toStoredDocumentRecord,
 } from "../../../permanentSync";
-import { splitID } from "../../../connections";
 import { storedDocumentToEvent } from "../../../documentMaterialization";
 import { useCacheDB } from "./CacheDBContext";
 import {
@@ -111,51 +105,44 @@ export function NostrCacheSync(): null {
   const db = useCacheDB();
   const addEvents = useDocumentStore()?.addEvents;
   const { relayPool } = useApis();
-  const { user, contacts, contactsRelays, panes } = useData();
-  const { userRelays } = useUserRelayContext();
-  const defaultRelays = useDefaultRelays();
-
-  const extraAuthors = useMemo(
-    () => [
-      ...new globalThis.Set(
-        panes.flatMap((pane) =>
-          pane.rootNodeId
-            ? [pane.author, splitID(pane.rootNodeId)[0] || pane.author]
-            : [pane.author]
-        )
-      ),
-    ],
-    [panes]
+  const backend = useBackend();
+  const { user, panes, publishEventsStatus } = useData();
+  const storageRelayUrls = useMemo(
+    () => normalizedRelayUrls(backend.workspaceConfig.storageRelays),
+    [backend.workspaceConfig.storageRelays]
   );
-
-  const authors = useMemo(
+  const foreignSources = useMemo(
     () =>
-      [
-        ...new globalThis.Set([
-          ...buildPermanentSyncAuthors(user.publicKey, contacts),
-          ...extraAuthors,
-        ]),
-      ].sort(),
-    [user.publicKey, contacts, extraAuthors]
-  );
-
-  const relayUrls = useMemo(
-    () =>
-      [
-        ...new Set(
-          getReadRelays([
-            ...defaultRelays,
-            ...userRelays,
-            ...flattenRelays(contactsRelays),
-          ])
-            .flatMap((relay) => sanitizeRelays([relay]).map((r) => r.url))
-            .map((url) => url.trim().replace(/\/$/, ""))
+      panes
+        .flatMap((pane) => {
+          const coordinate = pane.routeCoordinate;
+          if (
+            !coordinate ||
+            coordinate.eventKind !== KIND_KNOWLEDGE_DOCUMENT ||
+            coordinate.pubkey === user?.publicKey ||
+            !pane.storageKey
+          ) {
+            return [];
+          }
+          const relays = normalizedRelayUrls(coordinate.relays);
+          return relays.length === 0
+            ? []
+            : [{ coordinate, storageKey: pane.storageKey, relays }];
+        })
+        .filter(
+          (source, index, sources) =>
+            sources.findIndex(
+              (candidate) =>
+                candidate.coordinate.pubkey === source.coordinate.pubkey &&
+                candidate.coordinate.dTag === source.coordinate.dTag &&
+                candidate.storageKey === source.storageKey &&
+                candidate.relays.join("|") === source.relays.join("|")
+            ) === index
         ),
-      ].sort(),
-    [defaultRelays, userRelays, contactsRelays]
+    [panes, user?.publicKey]
   );
+  const foreignSourcesSignature = JSON.stringify(foreignSources);
 
-  // Load persisted state and subscribe to cross-tab changes
   useEffect(() => {
     if (!db || !addEvents) return () => {};
     const controller = new AbortController();
@@ -192,21 +179,45 @@ export function NostrCacheSync(): null {
     };
   }, [db, addEvents]);
 
-  // Subscribe to relays for live documents/deletes
   useEffect(() => {
-    if (db === undefined || relayUrls.length === 0 || authors.length === 0) {
-      return () => {};
-    }
-    return startPermanentDocumentSync({
-      db: db || null,
-      relayPool,
-      relayUrls,
-      authors,
-      addLiveEvents: addEvents,
-    });
-  }, [addEvents, authors, db, relayPool, relayUrls]);
+    const closers = [
+      ...(user
+        ? [
+            startPermanentDocumentSync({
+              db: db || null,
+              relayPool,
+              relayUrls: storageRelayUrls,
+              authors: [user.publicKey],
+              user,
+              capabilityKeys: [],
+              dTags: [],
+              addLiveEvents: addEvents,
+            }),
+          ]
+        : []),
+      ...foreignSources.map((source) =>
+        startPermanentDocumentSync({
+          db: null,
+          relayPool,
+          relayUrls: source.relays,
+          authors: [source.coordinate.pubkey],
+          user,
+          capabilityKeys: [source.storageKey],
+          dTags: [source.coordinate.dTag],
+          addLiveEvents: addEvents,
+        })
+      ),
+    ];
+    return () => closers.forEach((close) => close());
+  }, [
+    addEvents,
+    db,
+    relayPool,
+    storageRelayUrls,
+    user,
+    foreignSourcesSignature,
+  ]);
 
-  // Persist locally-added events to IndexedDB
   const persistEvents = useMemo(() => {
     if (!db) return undefined;
     return (events: ReadonlyArray<Event | UnsignedEvent>) => {
@@ -225,14 +236,12 @@ export function NostrCacheSync(): null {
           db,
           events
             .map(toCachedEvent)
-            .filter((e): e is CachedEvent => e !== undefined)
+            .filter((event): event is CachedEvent => event !== undefined)
         ).catch(() => undefined);
       }
     };
   }, [db]);
 
-  // Persist unpublishedEvents (from planner) to IndexedDB so they survive reload
-  const { publishEventsStatus } = useData();
   useEffect(() => {
     if (!persistEvents || publishEventsStatus.unsignedEvents.size === 0) {
       return;

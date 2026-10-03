@@ -1,6 +1,7 @@
 import { Collection, List } from "immutable";
 import { Event, EventTemplate, Filter, UnsignedEvent } from "nostr-tools";
-import type { Document, DocumentDelete } from "./Document";
+import type { DocumentDelete, ParsedDocument } from "./core/Document";
+import { parseToDocument } from "./core/Document";
 import { KIND_DELETE, KIND_KNOWLEDGE_DOCUMENT } from "./nostr";
 
 export function findAllTags(
@@ -68,17 +69,24 @@ export function sanitizeAuthorsFilter(filter: Filter): Filter {
     : filter;
 }
 
-export function eventToDocument(
-  event: Event | UnsignedEvent
-): Document | undefined {
+export function eventToParsed(
+  event: (Event | UnsignedEvent) & Partial<EventAttachment>
+): ParsedDocument | undefined {
   if (event.kind !== KIND_KNOWLEDGE_DOCUMENT) return undefined;
-  const docId = findTag(event, "d");
-  if (!docId) return undefined;
+  const dTag = findTag(event, "d");
+  if (!dTag) return undefined;
+  const systemRole = findTag(event, "s");
+  const parsed = parseToDocument(event.pubkey as PublicKey, event.content, {
+    updatedMsOverride: getEventMs(event),
+    docIdFallback: dTag,
+    ...(systemRole === "log"
+      ? { systemRoleOverride: "log" as RootSystemRole }
+      : {}),
+  });
+  const { storageKey } = event;
   return {
-    author: event.pubkey as PublicKey,
-    docId,
-    updatedMs: getEventMs(event),
-    content: event.content,
+    document: storageKey ? { ...parsed.document, storageKey } : parsed.document,
+    nodes: parsed.nodes,
   };
 }
 
@@ -98,7 +106,7 @@ export function eventToDocumentDelete(
   const docId = parts.slice(2).join(":");
   if (!author || !docId) return undefined;
   return {
-    author,
+    sourceId: author,
     docId,
     deletedAt: getEventMs(event),
   };

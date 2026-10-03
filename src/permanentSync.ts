@@ -5,7 +5,6 @@ import { findTag, getEventMs } from "./nostrEvents";
 import {
   KIND_DELETE,
   KIND_KNOWLEDGE_DOCUMENT,
-  KIND_KNOWLEDGE_DOCUMENT_SNAPSHOT,
   getReplaceableKey,
 } from "./nostr";
 import type {
@@ -24,6 +23,7 @@ import {
   removeStoredDelete,
   removeStoredDocument,
 } from "./infra/nostr/cache/indexedDB";
+import { decryptStorageEvent } from "./storageEncryption";
 import { collectEventsUntilIdle } from "./eventQuery";
 
 const PERMANENT_SYNC_BACKFILL_PAGE_LIMIT = 200;
@@ -36,27 +36,33 @@ type PermanentSyncState = {
   checkpoints: Map<PublicKey, SyncCheckpointRecord>;
 };
 
-export function buildPermanentSyncAuthors(
-  myself: PublicKey,
-  contacts: Contacts
-): PublicKey[] {
-  return contacts.keySeq().toSet().add(myself).toArray().sort();
-}
-
-export function buildPermanentSyncFilters(authors: PublicKey[]): Filter[] {
+export function buildPermanentSyncFilters(
+  authors: PublicKey[],
+  dTags: readonly string[]
+): Filter[] {
   if (authors.length === 0) {
     return [];
   }
   return [
     {
       authors,
-      kinds: [KIND_KNOWLEDGE_DOCUMENT, KIND_KNOWLEDGE_DOCUMENT_SNAPSHOT],
+      kinds: [KIND_KNOWLEDGE_DOCUMENT],
+      ...(dTags.length > 0 ? { "#d": [...dTags] } : {}),
       limit: 0,
     },
     {
       authors,
       kinds: [KIND_DELETE],
       "#k": [`${KIND_KNOWLEDGE_DOCUMENT}`],
+      ...(dTags.length > 0
+        ? {
+            "#a": authors.flatMap((author) =>
+              dTags.map(
+                (dTag) => `${KIND_KNOWLEDGE_DOCUMENT}:${author}:${dTag}`
+              )
+            ),
+          }
+        : {}),
       limit: 0,
     },
   ];
@@ -64,7 +70,8 @@ export function buildPermanentSyncFilters(authors: PublicKey[]): Filter[] {
 
 export function buildPermanentCatchUpFilters(
   authors: PublicKey[],
-  checkpoints: ReadonlyMap<PublicKey, SyncCheckpointRecord>
+  checkpoints: ReadonlyMap<PublicKey, SyncCheckpointRecord>,
+  dTags: readonly string[]
 ): Filter[] {
   const authorsWithCheckpoint = authors.filter(
     (author) => (checkpoints.get(author)?.latestSeenLiveCreatedAt || 0) > 0
@@ -83,12 +90,22 @@ export function buildPermanentCatchUpFilters(
     {
       authors: authorsWithCheckpoint,
       kinds: [KIND_KNOWLEDGE_DOCUMENT],
+      ...(dTags.length > 0 ? { "#d": [...dTags] } : {}),
       since,
     },
     {
       authors: authorsWithCheckpoint,
       kinds: [KIND_DELETE],
       "#k": [`${KIND_KNOWLEDGE_DOCUMENT}`],
+      ...(dTags.length > 0
+        ? {
+            "#a": authorsWithCheckpoint.flatMap((author) =>
+              dTags.map(
+                (dTag) => `${KIND_KNOWLEDGE_DOCUMENT}:${author}:${dTag}`
+              )
+            ),
+          }
+        : {}),
       since,
     },
   ];
@@ -98,15 +115,27 @@ export function buildPermanentBackfillFilter({
   author,
   until,
   kind,
+  dTags,
 }: {
   author: PublicKey;
   until?: number;
   kind: typeof KIND_KNOWLEDGE_DOCUMENT | typeof KIND_DELETE;
+  dTags: readonly string[];
 }): Filter {
   return {
     authors: [author],
     kinds: [kind],
     ...(kind === KIND_DELETE ? { "#k": [`${KIND_KNOWLEDGE_DOCUMENT}`] } : {}),
+    ...(dTags.length > 0 && kind === KIND_KNOWLEDGE_DOCUMENT
+      ? { "#d": [...dTags] }
+      : {}),
+    ...(dTags.length > 0 && kind === KIND_DELETE
+      ? {
+          "#a": dTags.map(
+            (dTag) => `${KIND_KNOWLEDGE_DOCUMENT}:${author}:${dTag}`
+          ),
+        }
+      : {}),
     ...(until !== undefined ? { until } : {}),
     limit: PERMANENT_SYNC_BACKFILL_PAGE_LIMIT,
   };
@@ -122,7 +151,7 @@ export function getStoredEventID(
 }
 
 export function toStoredDocumentRecord(
-  event: Event | UnsignedEvent,
+  event: (Event | UnsignedEvent) & Partial<EventAttachment>,
   filePath?: string
 ): StoredDocumentRecord | undefined {
   if (event.kind !== KIND_KNOWLEDGE_DOCUMENT) {
@@ -143,6 +172,7 @@ export function toStoredDocumentRecord(
     content: event.content,
     tags: event.tags,
     ...(filePath !== undefined && { filePath }),
+    ...(event.storageKey !== undefined && { storageKey: event.storageKey }),
   };
 }
 
@@ -331,12 +361,18 @@ export function startPermanentDocumentSync({
   relayPool,
   relayUrls,
   authors,
+  user,
+  capabilityKeys,
+  dTags,
   addLiveEvents,
 }: {
   db: StashmapDB | null;
   relayPool: SimplePool;
   relayUrls: string[];
   authors: PublicKey[];
+  user: User | undefined;
+  capabilityKeys: ReadonlyArray<string>;
+  dTags: readonly string[];
   addLiveEvents?: (events: ImmutableMap<string, Event | UnsignedEvent>) => void;
 }): () => void {
   if (
@@ -353,21 +389,28 @@ export function startPermanentDocumentSync({
     checkpoints: new Map<PublicKey, SyncCheckpointRecord>(),
   };
 
-  const applyIncomingEvent = async (event: Event): Promise<void> => {
-    if (!state.active || !event.id || state.seenEventIds.has(event.id)) {
+  const applyIncomingEvent = async (wireEvent: Event): Promise<void> => {
+    if (
+      !state.active ||
+      !wireEvent.id ||
+      state.seenEventIds.has(wireEvent.id)
+    ) {
       return;
     }
-    state.seenEventIds.add(event.id);
+    state.seenEventIds.add(wireEvent.id);
+
+    const decrypted = await decryptStorageEvent(
+      wireEvent,
+      user,
+      capabilityKeys
+    );
+    if (!decrypted) {
+      return;
+    }
+    const event = { ...decrypted, id: wireEvent.id, sig: wireEvent.sig };
 
     if (!db) {
       addLiveEvents?.(ImmutableMap([[event.id, event]]));
-    }
-
-    if (event.kind === KIND_KNOWLEDGE_DOCUMENT_SNAPSHOT) {
-      if (db) {
-        addLiveEvents?.(ImmutableMap([[event.id, event]]));
-      }
-      return;
     }
 
     const document = toStoredDocumentRecord(event);
@@ -399,7 +442,11 @@ export function startPermanentDocumentSync({
   };
 
   const runCatchUp = async (): Promise<void> => {
-    const filters = buildPermanentCatchUpFilters(authors, state.checkpoints);
+    const filters = buildPermanentCatchUpFilters(
+      authors,
+      state.checkpoints,
+      dTags
+    );
     const events = await queryPermanentSyncFilters(
       relayPool,
       relayUrls,
@@ -439,6 +486,7 @@ export function startPermanentDocumentSync({
         oldestFetchedCreatedAt !== undefined
           ? oldestFetchedCreatedAt - 1
           : undefined,
+      dTags,
     });
     const events = await queryPermanentSyncFilters(relayPool, relayUrls, [
       filter,
@@ -499,30 +547,17 @@ export function startPermanentDocumentSync({
     await runBackfillForAuthor(restAuthors);
   };
 
-  const runSnapshotSync = async (): Promise<void> => {
-    if (!state.active || authors.length === 0) {
-      return;
-    }
-    const events = await queryPermanentSyncFilters(relayPool, relayUrls, [
-      { authors, kinds: [KIND_KNOWLEDGE_DOCUMENT_SNAPSHOT] },
-    ]);
-    if (state.active && events.length > 0) {
-      await applyQueriedEvents(events);
-    }
-  };
-
   loadPermanentSyncCheckpoints(db, authors)
     .then(async (checkpoints) => {
       state.checkpoints = checkpoints;
       await runCatchUp();
-      await runSnapshotSync();
       await runBackfillForAuthor(authors);
     })
     .catch(() => undefined);
 
   const sub = relayPool.subscribeMany(
     relayUrls,
-    buildPermanentSyncFilters(authors),
+    buildPermanentSyncFilters(authors, dTags),
     {
       onevent(event: Event): void {
         applyIncomingEvent(event).catch(() => undefined);

@@ -9,14 +9,10 @@ const {
 const fs = require("fs");
 const path = require("path");
 // eslint-disable-next-line import/no-unresolved
-const { loadCliProfile } = require("../dist/cli/config");
-// eslint-disable-next-line import/no-unresolved
 const {
-  loadWorkspaceAsDocuments,
-  saveDocumentsToWorkspace,
-} = require("../dist/core/workspaceBackend");
-// eslint-disable-next-line import/no-unresolved
-const { createWorkspaceProfile } = require("../dist/cli/init");
+  loadCliProfile,
+  writeCliWorkspaceConfig,
+} = require("../dist/cli/config");
 // eslint-disable-next-line import/no-unresolved
 const {
   createRecentWorkspacesStore,
@@ -25,81 +21,44 @@ const {
 } = require("../dist/electronMain/recentWorkspaces");
 // eslint-disable-next-line import/no-unresolved
 const { convertInputToPrivateKey } = require("../dist/nostrKey");
-const { hexToBytes } = require("@noble/hashes/utils");
+const { assertFetchableFeedUrl } = require("../dist/core/ical");
 // eslint-disable-next-line import/no-unresolved
-const { watchWorkspace } = require("../dist/core/workspaceWatcher");
-const crypto = require("crypto");
+const {
+  createWorkspaceRuntime,
+} = require("../dist/infra/filesystem/workspaceRuntime");
 
-const ECHO_TTL_MS = 2000;
-
-function hashContent(content) {
-  return crypto.createHash("sha256").update(content).digest("hex");
-}
-
-const watcherState = {
-  watcher: null,
+const workspaceRuntimeState = {
+  runtime: null,
   workspaceDir: null,
-  pendingEchoes: new Map(),
-  pendingUnlinkEchoes: new Map(),
 };
 
-function isOwnEcho(event) {
-  const now = Date.now();
-  if (event.type === "unlink") {
-    const expiresAt = watcherState.pendingUnlinkEchoes.get(event.relativePath);
-    if (expiresAt && expiresAt > now) {
-      watcherState.pendingUnlinkEchoes.delete(event.relativePath);
-      return true;
-    }
-    return false;
-  }
-  const pending = watcherState.pendingEchoes.get(event.relativePath);
-  if (
-    pending &&
-    pending.expiresAt > now &&
-    pending.hash === hashContent(event.content)
-  ) {
-    watcherState.pendingEchoes.delete(event.relativePath);
-    return true;
-  }
-  return false;
-}
-
-function broadcastFsEvent(event) {
-  if (isOwnEcho(event)) return;
+function sendFsEventToWindows(event) {
   BrowserWindow.getAllWindows().forEach((win) => {
     win.webContents.send("workspace:fs-event", event);
   });
 }
 
-async function stopWatcher() {
-  if (!watcherState.watcher) return;
-  const pending = watcherState.watcher;
-  watcherState.watcher = null;
-  watcherState.workspaceDir = null;
-  const instance = await pending;
-  await instance.close();
+async function stopWorkspaceRuntime() {
+  if (!workspaceRuntimeState.runtime) return;
+  const runtime = workspaceRuntimeState.runtime;
+  workspaceRuntimeState.runtime = null;
+  workspaceRuntimeState.workspaceDir = null;
+  await runtime.dispose();
 }
 
-async function startWatcher(workspaceDir) {
-  await stopWatcher();
-  watcherState.workspaceDir = workspaceDir;
-  watcherState.watcher = watchWorkspace(workspaceDir, broadcastFsEvent);
-}
-
-function recordSaveEchoes(documents, deletedPaths) {
-  const expiresAt = Date.now() + ECHO_TTL_MS;
-  documents.forEach((doc) => {
-    if (doc.filePath !== undefined) {
-      watcherState.pendingEchoes.set(doc.filePath, {
-        hash: hashContent(doc.content),
-        expiresAt,
-      });
-    }
-  });
-  (deletedPaths || []).forEach((relativePath) => {
-    watcherState.pendingUnlinkEchoes.set(relativePath, expiresAt);
-  });
+async function getWorkspaceRuntime(workspaceDir) {
+  if (
+    workspaceRuntimeState.runtime &&
+    workspaceRuntimeState.workspaceDir === workspaceDir
+  ) {
+    return workspaceRuntimeState.runtime;
+  }
+  await stopWorkspaceRuntime();
+  const runtime = createWorkspaceRuntime(workspaceDir);
+  runtime.subscribeFsEvents(sendFsEventToWindows);
+  workspaceRuntimeState.runtime = runtime;
+  workspaceRuntimeState.workspaceDir = workspaceDir;
+  return runtime;
 }
 
 const devServerUrl = process.env.ELECTRON_START_URL;
@@ -120,19 +79,26 @@ function envCliProfileArgs() {
 
 const recentWorkspaces = createRecentWorkspacesStore();
 
-async function loadProfileAndEvents(profile) {
-  const documents = await loadWorkspaceAsDocuments({
-    pubkey: profile.pubkey,
-    workspaceDir: profile.workspaceDir,
-  });
-  if (watcherState.workspaceDir !== profile.workspaceDir) {
-    await startWatcher(profile.workspaceDir);
+function readProfilePrivateKey(profile) {
+  if (!profile.nsecFile || !fs.existsSync(profile.nsecFile)) {
+    return undefined;
   }
-  return { profile, documents };
+  try {
+    const raw = fs.readFileSync(profile.nsecFile, "utf8");
+    return convertInputToPrivateKey(raw) || undefined;
+  } catch {
+    return undefined;
+  }
 }
 
-function isInitialisedFolder(folder) {
-  return fs.existsSync(path.join(folder, ".knowstr", "profile.json"));
+async function loadProfileAndEvents(profile) {
+  const runtime = await getWorkspaceRuntime(profile.workspaceDir);
+  const loaded = await runtime.load();
+  return {
+    profile: loaded.profile,
+    files: loaded.files,
+    privateKey: readProfilePrivateKey(loaded.profile),
+  };
 }
 
 async function loadFromFolder(folder) {
@@ -151,7 +117,7 @@ async function loadCurrentWorkspace() {
     return null;
   }
   const entry = pruned.workspaces[id];
-  if (!entry || !isInitialisedFolder(entry.path)) {
+  if (!entry || !fs.existsSync(entry.path)) {
     return null;
   }
   return loadFromFolder(entry.path);
@@ -181,30 +147,10 @@ function reloadFocusedWindow() {
   }
 }
 
-async function confirmInitialise(folder) {
-  const result = await dialog.showMessageBox({
-    type: "question",
-    buttons: ["Initialize", "Cancel"],
-    defaultId: 0,
-    cancelId: 1,
-    title: "Initialize Workspace",
-    message: `${folder} isn't a workspace yet.`,
-    detail: "Initialize it as a new workspace with a freshly generated key?",
-  });
-  return result.response === 0;
-}
-
 async function handleOpenWorkspaceMenuAction() {
   const folder = await pickWorkspaceFolder();
   if (!folder) {
     return;
-  }
-  if (!isInitialisedFolder(folder)) {
-    const ok = await confirmInitialise(folder);
-    if (!ok) {
-      return;
-    }
-    createWorkspaceProfile({ workspaceDir: folder });
   }
   recordOpenedWorkspace(folder);
   reloadFocusedWindow();
@@ -212,10 +158,10 @@ async function handleOpenWorkspaceMenuAction() {
 }
 
 function handleSwitchWorkspaceMenuAction(folder) {
-  if (!isInitialisedFolder(folder)) {
+  if (!fs.existsSync(folder)) {
     dialog.showErrorBox(
       "Workspace not available",
-      `${folder} no longer contains a workspace.`
+      `${folder} no longer exists.`
     );
     buildAndSetMenu();
     return;
@@ -337,57 +283,88 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+  // Calendar feeds fetch in the main process: no CORS in Node, and the
+  // renderer never gets network powers beyond this one text fetch. The
+  // url and every redirect hop must pass the shared feed-url validation.
+  ipcMain.handle("net:fetch-text", async (_event, url) => {
+    const MAX_REDIRECTS = 5;
+    const MAX_BYTES = 2 * 1024 * 1024;
+    let target = String(url).replace(/^webcal:\/\//u, "https://");
+    for (let hop = 0; hop <= MAX_REDIRECTS; hop += 1) {
+      assertFetchableFeedUrl(target);
+      const response = await fetch(new URL(target), {
+        signal: AbortSignal.timeout(10000),
+        redirect: "manual",
+      });
+      if (response.status >= 300 && response.status < 400) {
+        const location = response.headers.get("location");
+        if (!location) {
+          throw new Error(`status ${response.status}`);
+        }
+        target = new URL(location, target).toString();
+        continue;
+      }
+      if (!response.ok) {
+        throw new Error(`status ${response.status}`);
+      }
+      const body = await response.text();
+      if (body.length > MAX_BYTES) {
+        throw new Error("feed too large");
+      }
+      return body;
+    }
+    throw new Error("too many redirects");
+  });
   ipcMain.handle("workspace:load", async () => loadCurrentWorkspace());
   ipcMain.handle("workspace:pickFolder", async () => pickWorkspaceFolder());
-  ipcMain.handle("workspace:isInitialised", async (_event, folder) =>
-    isInitialisedFolder(folder)
-  );
   ipcMain.handle("workspace:open", async (_event, folder) => {
-    if (!isInitialisedFolder(folder)) {
-      throw new Error(`${folder} is not an initialised workspace`);
+    if (!fs.existsSync(folder)) {
+      throw new Error(`${folder} does not exist`);
     }
     recordOpenedWorkspace(folder);
     buildAndSetMenu();
   });
   ipcMain.handle("workspace:create", async (_event, args) => {
-    const { folder, secretKeyInput } = args || {};
+    const { folder } = args || {};
     if (!folder) {
       throw new Error("workspace:create requires a folder");
     }
-    const secretKey = secretKeyInput
-      ? (() => {
-          const hex = convertInputToPrivateKey(secretKeyInput);
-          if (!hex) {
-            throw new Error(
-              "Input is not a valid nsec, private key or mnemonic"
-            );
-          }
-          return hexToBytes(hex);
-        })()
-      : undefined;
-    createWorkspaceProfile({ workspaceDir: folder, secretKey });
+    fs.mkdirSync(folder, { recursive: true });
     recordOpenedWorkspace(folder);
     buildAndSetMenu();
+  });
+  ipcMain.handle("workspace:configure", async (_event, config) => {
+    const envArgs = envCliProfileArgs();
+    const pruned = recentWorkspaces.listAndPrune();
+    const autoOpenId = pickAutoOpenId(pruned);
+    const autoOpenEntry = autoOpenId
+      ? pruned.workspaces[autoOpenId]
+      : undefined;
+    const workspaceDir = envArgs
+      ? loadCliProfile(envArgs).workspaceDir
+      : autoOpenEntry?.path;
+    if (!workspaceDir) {
+      throw new Error("workspace:configure has no active workspace");
+    }
+    writeCliWorkspaceConfig(workspaceDir, config);
   });
   ipcMain.handle("workspace:save", async (_event, documents, deletedPaths) => {
     const envArgs = envCliProfileArgs();
     const pruned = recentWorkspaces.listAndPrune();
     const autoOpenId = pickAutoOpenId(pruned);
-    const autoOpenEntry = autoOpenId ? pruned.workspaces[autoOpenId] : undefined;
+    const autoOpenEntry = autoOpenId
+      ? pruned.workspaces[autoOpenId]
+      : undefined;
     const profile = envArgs
       ? loadCliProfile(envArgs)
       : autoOpenEntry
-        ? loadCliProfile({ cwd: autoOpenEntry.path })
-        : null;
+      ? loadCliProfile({ cwd: autoOpenEntry.path })
+      : null;
     if (!profile) {
       throw new Error("workspace:save has no active workspace");
     }
-    recordSaveEchoes(documents, deletedPaths);
-    return saveDocumentsToWorkspace(
-      { pubkey: profile.pubkey, workspaceDir: profile.workspaceDir },
-      documents,
-      deletedPaths
-    );
+    const runtime = await getWorkspaceRuntime(profile.workspaceDir);
+    return runtime.save(documents, deletedPaths);
   });
 
   buildAndSetMenu();
@@ -407,5 +384,5 @@ app.on("window-all-closed", () => {
 });
 
 app.on("before-quit", () => {
-  stopWatcher();
+  stopWorkspaceRuntime();
 });

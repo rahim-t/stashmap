@@ -1,9 +1,10 @@
 import fs from "fs";
 import os from "os";
 import path from "path";
+import { SimplePool } from "nostr-tools";
 import { runInitCommand } from "../cli/init";
 import { runSaveCommand } from "../cli/save";
-import { runApplyCommand } from "../cli/apply";
+import { Rejection, runPublishCommand } from "../cli/publish";
 
 type InitResult = {
   nsec: string;
@@ -14,16 +15,16 @@ type InitResult = {
 
 type InitOptions = {
   relays?: string[];
-  doc?: string;
 };
 
 export function knowstrInit(options: InitOptions = {}): InitResult {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "knowstr-test-"));
-  const relayArgs = (options.relays ?? []).flatMap((url) => ["--relay", url]);
-  const docArgs = options.doc ? ["--doc", options.doc] : [];
-  const result = runInitCommand([...relayArgs, ...docArgs], tempDir);
-  if ("help" in result) {
-    throw new Error("knowstrInit: unexpected help output");
+  const relayArgs = (options.relays ?? ["wss://room.example/"]).flatMap(
+    (url) => ["--relay", url]
+  );
+  const result = runInitCommand(["--shared", ...relayArgs], tempDir);
+  if ("help" in result || !result.configured) {
+    throw new Error("knowstrInit: unexpected unconfigured result");
   }
   const nsecPath = path.join(tempDir, ".knowstr", "me.nsec");
   const nsec = fs.readFileSync(nsecPath, "utf8").trim();
@@ -51,7 +52,7 @@ function profilePathFor(workspaceDir: string): string {
 
 export async function knowstrSave(
   workspaceDir: string
-): Promise<{ changed_paths: string[] }> {
+): Promise<{ changed_paths: string[]; warnings: string[] }> {
   const result = await runSaveCommand([
     "--config",
     profilePathFor(workspaceDir),
@@ -62,23 +63,22 @@ export async function knowstrSave(
   return result;
 }
 
-type ApplyResult = Exclude<
-  Awaited<ReturnType<typeof runApplyCommand>>,
-  { help: true; text: string }
->;
-
-export async function knowstrApply(
+export async function knowstrPublish(
   workspaceDir: string,
-  options: { dryRun?: boolean } = {}
-): Promise<ApplyResult> {
-  const args = [
-    "--config",
-    profilePathFor(workspaceDir),
-    ...(options.dryRun ? ["--dry-run"] : []),
-  ];
-  const result = await runApplyCommand(args);
+  pool: Pick<SimplePool, "ensureRelay" | "publish" | "close">
+): Promise<{
+  changed_paths: string[];
+  accepted_paths: string[];
+  unaccepted_paths: string[];
+  rejections: Rejection[];
+  warnings: string[];
+}> {
+  const result = await runPublishCommand(
+    ["--config", profilePathFor(workspaceDir)],
+    pool
+  );
   if ("help" in result) {
-    throw new Error("knowstrApply: unexpected help output");
+    throw new Error("knowstrPublish: unexpected help output");
   }
   return result;
 }

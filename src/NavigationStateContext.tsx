@@ -6,15 +6,20 @@ import React, {
   useState,
 } from "react";
 import { useData } from "./DataContext";
-import { getNodeRouteTargetInfo } from "./connections";
+import { LOCAL } from "./core/nodeRef";
 import {
-  pathToStack,
-  buildNodeUrl,
+  buildCoordinateRouteUrl,
+  buildDocumentRouteUrl,
   buildNodeRouteUrl,
+  parseAtFromSearch,
+  parseCoordinateRouteUrl,
+  parseDocumentRouteUrl,
+  parseFallbackLabelFromSearch,
   parseNodeRouteUrl,
-  parseAuthorFromSearch,
+  parseStorageKeyFromHash,
+  resolveAddress,
+  routeCoordinateSourceId,
 } from "./navigationUrl";
-import { resolveSemanticStackToActualIDs } from "./semanticNavigation";
 import { usePlanner } from "./planner";
 import { generatePaneId } from "./SplitPanesContext";
 
@@ -43,53 +48,98 @@ type HistoryState = {
   activePaneIndex: number;
 };
 
-function paneToUrl(
-  activePane: Pane,
-  knowledgeDBs: KnowledgeDBs,
-  myself: PublicKey
-): string | undefined {
-  if (activePane.rootNodeId) {
-    return buildNodeRouteUrl(activePane.rootNodeId, activePane.scrollToId);
-  }
-
-  if (activePane.stack.length > 0) {
-    const resolved = resolveSemanticStackToActualIDs(
-      knowledgeDBs,
-      activePane.author,
-      activePane.stack as ID[]
+function paneToUrl(activePane: Pane): string | undefined {
+  const withStorageKey = (url: string): string =>
+    activePane.storageKey === undefined || !url.startsWith("/storage/")
+      ? url
+      : `${url}#key=${encodeURIComponent(activePane.storageKey)}`;
+  if (activePane.routeCoordinate) {
+    const prefix =
+      activePane.routeCoordinate.eventKind === 34774 ? "deposit" : "storage";
+    return withStorageKey(
+      buildCoordinateRouteUrl(
+        prefix,
+        activePane.routeCoordinate,
+        activePane.scrollToId ?? activePane.rootNodeId,
+        undefined
+      )
     );
-    if (resolved?.node) {
-      return buildNodeRouteUrl(resolved.node.id, activePane.scrollToId);
-    }
+  }
+  if (activePane.documentId) {
+    return withStorageKey(
+      buildDocumentRouteUrl(
+        activePane.sourceId,
+        activePane.documentId,
+        activePane.scrollToId
+      )
+    );
+  }
+  if (activePane.rootNodeId) {
+    return withStorageKey(
+      buildNodeRouteUrl(activePane.rootNodeId, activePane.sourceId, {
+        scrollToId: activePane.scrollToId,
+        fallbackLabel: activePane.fallbackLabel,
+      })
+    );
   }
 
-  return buildNodeUrl(
-    activePane.stack,
-    knowledgeDBs,
-    myself,
-    activePane.author
-  );
+  return "/";
 }
 
 function urlToPane(
   pathname: string,
   search: string,
-  fallbackAuthor: PublicKey
+  hash: string,
+  myPublicKey: PublicKey | undefined
 ): Pane {
-  const author = parseAuthorFromSearch(search) || fallbackAuthor;
+  const fallbackLabel = parseFallbackLabelFromSearch(search);
+  const at = parseAtFromSearch(search);
+  const storageKey = parseStorageKeyFromHash(hash);
+  const documentRoute = parseDocumentRouteUrl(pathname);
+  if (documentRoute) {
+    return {
+      id: generatePaneId(),
+      sourceId: LOCAL,
+      documentId: documentRoute.docId,
+      scrollToId: at,
+    };
+  }
+  const storageRoute = parseCoordinateRouteUrl(pathname, "storage");
+  if (storageRoute) {
+    return {
+      id: generatePaneId(),
+      sourceId: resolveAddress(storageRoute.pubkey, myPublicKey),
+      routeCoordinate: storageRoute,
+      ...(at === undefined
+        ? { documentId: storageRoute.dTag }
+        : { rootNodeId: at }),
+      ...(storageKey !== undefined && { storageKey }),
+    };
+  }
+  const depositRoute = parseCoordinateRouteUrl(pathname, "deposit");
+  if (depositRoute) {
+    return {
+      id: generatePaneId(),
+      sourceId: routeCoordinateSourceId(depositRoute),
+      routeCoordinate: depositRoute,
+      ...(at === undefined
+        ? { documentId: depositRoute.dTag }
+        : { rootNodeId: at }),
+    };
+  }
   const nodeID = parseNodeRouteUrl(pathname);
   if (nodeID) {
     return {
       id: generatePaneId(),
-      stack: [],
-      author: fallbackAuthor,
+      sourceId: LOCAL,
       rootNodeId: nodeID,
+      scrollToId: at,
+      ...(fallbackLabel !== undefined && { fallbackLabel }),
     };
   }
   return {
     id: generatePaneId(),
-    stack: pathToStack(pathname),
-    author,
+    sourceId: LOCAL,
   };
 }
 
@@ -98,7 +148,7 @@ export function NavigationStateProvider({
 }: {
   children: React.ReactNode;
 }): JSX.Element {
-  const { panes, knowledgeDBs, user } = useData();
+  const { panes, user } = useData();
   const { setPanes } = usePlanner();
   const [activePaneIndex, setActivePaneIndexState] = useState(
     () =>
@@ -125,57 +175,11 @@ export function NavigationStateProvider({
   };
 
   useEffect(() => {
-    const needsResolution = panes.some(
-      (p) => (p.rootNodeId && p.stack.length === 0) || p.stack.length > 0
-    );
-    if (!needsResolution) {
-      return;
-    }
-    const resolved = panes.map((p) => {
-      if (p.rootNodeId && p.stack.length === 0) {
-        const nodeInfo = getNodeRouteTargetInfo(
-          p.rootNodeId,
-          knowledgeDBs,
-          p.author
-        );
-        if (!nodeInfo) {
-          return p;
-        }
-        return {
-          ...p,
-          stack: nodeInfo.stack,
-          author: nodeInfo.author,
-          rootNodeId: nodeInfo.rootNodeId,
-        };
-      }
-
-      if (p.stack.length === 0) {
-        return p;
-      }
-      const resolvedStack = resolveSemanticStackToActualIDs(
-        knowledgeDBs,
-        p.author,
-        p.stack as ID[]
-      )?.actualStack;
-      if (!resolvedStack) {
-        return p;
-      }
-      const stackChanged = resolvedStack.some(
-        (id, index) => id !== p.stack[index]
-      );
-      return stackChanged ? { ...p, stack: resolvedStack } : p;
-    });
-    if (resolved.some((p, i) => p !== panes[i])) {
-      setPanes(resolved);
-    }
-  }, [knowledgeDBs, panes, user.publicKey, setPanes]);
-
-  useEffect(() => {
     const activePane = panes[safeActivePaneIndex];
     if (!activePane) {
       return;
     }
-    const fullUrl = paneToUrl(activePane, knowledgeDBs, user.publicKey);
+    const fullUrl = paneToUrl(activePane);
 
     if (fullUrl === undefined) {
       return;
@@ -212,7 +216,7 @@ export function NavigationStateProvider({
     }
     // eslint-disable-next-line functional/immutable-data
     prevUrlRef.current = fullUrl;
-  }, [panes, safeActivePaneIndex, knowledgeDBs, user.publicKey]);
+  }, [panes, safeActivePaneIndex, user?.publicKey]);
 
   useEffect(() => {
     const onPopState = (e: PopStateEvent): void => {
@@ -227,7 +231,8 @@ export function NavigationStateProvider({
           urlToPane(
             window.location.pathname,
             window.location.search,
-            user.publicKey
+            window.location.hash,
+            user?.publicKey
           ),
         ]);
         setActivePaneIndexState(0);
@@ -235,7 +240,7 @@ export function NavigationStateProvider({
     };
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);
-  }, [user.publicKey, setPanes]);
+  }, [user?.publicKey, setPanes]);
 
   return (
     <NavigationStateContext.Provider

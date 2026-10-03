@@ -1,0 +1,1051 @@
+import React from "react";
+import { List } from "immutable";
+import { LOCAL, nodeRefKey } from "../core/nodeRef";
+import {
+  ViewPath,
+  useSearchDepth,
+  useIsInSearchView,
+  useIsExpanded,
+  useIsRoot,
+  useNodeIndex,
+  useDisplayText,
+  useIsViewingOtherUserContent,
+  viewPathToString,
+  useCurrentNode,
+  useRow,
+  addNodesToLastElement,
+} from "../rowModel";
+import { isEditableNode } from "./temporaryViewState";
+import {
+  getVisibleParentRow,
+  planBatchIndent,
+  planBatchOutdent,
+} from "./batchOperations";
+import { isEmptyNodeID, computeEmptyNodeMetadata } from "../core/connections";
+import { isFileLinkHref, spansText, spansToMarkdown } from "../core/nodeSpans";
+import {
+  classifyLinkHref,
+  externalLinkUrl,
+  isEntityId,
+} from "../core/linkPath";
+import { embedTargetOf } from "../showings";
+import { feedUrlInSpans, isCalendarEntryId } from "../core/ical";
+import { resolveDocumentTarget } from "../core/Document";
+import { inlineLinkToHref, isDeadLinkTarget } from "./linkOperations";
+import { buildNodeRouteUrl } from "../navigationUrl";
+import { IncomingPart, ReferenceDisplay } from "./referenceDisplay";
+import { MiniEditor, ReciprocalLink, preventEditorBlur } from "./AddNode";
+import { EditorTextProvider } from "./EditorTextContext";
+import { linkStyleForHref } from "./editorDom";
+import { useOnToggleExpanded } from "./SelectNodes";
+import { useApis } from "../Apis";
+import { useData } from "../DataContext";
+import { planMaterializeComputedRow } from "../core/plan";
+import { getWorkspaceNode } from "../core/knowledge";
+import {
+  Plan,
+  usePlanner,
+  planSetEmptyNodePosition,
+  planSaveNodeAndEnsureNodes,
+  planExpandNode,
+  planRemoveEmptyNodePosition,
+  planAddSpansToParent,
+  planSetRowFocusIntent,
+  ParsedLine,
+} from "../planner";
+import { parsedLinesToTrees, planPasteMarkdownTrees } from "./FileDropZone";
+import { planDisconnectFromParent } from "../treeMutations";
+import { useNodeIsLoading } from "../LoadingStatus";
+import { NodeCard } from "../commons/Ui";
+import {
+  usePaneIndex,
+  useNavigatePane,
+  useCurrentPane,
+} from "../SplitPanesContext";
+import { RightMenu } from "./RightMenu";
+import { useItemStyle } from "./useItemStyle";
+import {
+  ResolvedNode,
+  getNodeInSource,
+  graphLookupFromData,
+  lookupNode,
+} from "../core/graphLookup";
+import { findReciprocalLinkItem } from "../buildReferenceRow";
+
+export { getNodesInTree } from "../treeTraversal";
+
+function getLevels(viewPath: ViewPath): number {
+  // Subtract 1: for pane index at position 0
+  // This gives: root = 1, first children = 2, nested = 3, etc.
+  return viewPath.length - 1;
+}
+
+function ExpandCollapseToggle(): JSX.Element | null {
+  const row = useRow();
+  const displayText = useDisplayText();
+  const onToggleExpanded = useOnToggleExpanded();
+  const isExpanded = useIsExpanded();
+  const isEmptyNode = isEmptyNodeID(row.node.id);
+  const onToggle = (): void => {
+    if (isEmptyNode) return;
+    onToggleExpanded(!isExpanded);
+  };
+
+  const toggleClass = [
+    "expand-collapse-toggle",
+    isEmptyNode ? "toggle-disabled" : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      onMouseDown={preventEditorBlur}
+      disabled={isEmptyNode}
+      className={toggleClass}
+      aria-label={
+        isExpanded ? `collapse ${displayText}` : `expand ${displayText}`
+      }
+      aria-expanded={isExpanded}
+    >
+      <span className={`triangle ${isExpanded ? "expanded" : "collapsed"}`}>
+        {isExpanded ? "▼" : "▶"}
+      </span>
+    </button>
+  );
+}
+
+function LoadingNode(): JSX.Element {
+  return <span className="skeleton-bar" />;
+}
+
+function ErrorContent(): JSX.Element {
+  return <span className="text-danger">Error: Node not found</span>;
+}
+
+function ReferenceContent({
+  reference,
+}: {
+  reference: {
+    id: ID;
+    text: string;
+    targetLabel: string;
+    contextLabels: string[];
+    sourceId: SourceId;
+    displayAs?: "incoming";
+    incomingRelevance?: Relevance;
+    incomingArgument?: Argument;
+  };
+}): JSX.Element {
+  const data = useData();
+  const row = useRow();
+  const navigatePane = useNavigatePane();
+  const href = inlineLinkToHref(
+    data,
+    `#${reference.id}`,
+    row.node,
+    reference.sourceId,
+    reference.targetLabel || reference.text
+  );
+  if (!href) return <ReferenceDisplay reference={reference} />;
+  return (
+    <a
+      href={href}
+      className="reference-link-btn"
+      onClick={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        navigatePane(href);
+      }}
+      aria-label={`Navigate to ${reference.text}`}
+    >
+      <ReferenceDisplay reference={reference} />
+    </a>
+  );
+}
+
+function reciprocalTarget(
+  data: Data,
+  node: GraphNode,
+  sourceId: SourceId,
+  href: string
+): ResolvedNode | undefined {
+  const graph = graphLookupFromData(data);
+  const targetClass = classifyLinkHref(href);
+  if (
+    targetClass === "entity" ||
+    targetClass === "node" ||
+    targetClass === "calendar"
+  ) {
+    return lookupNode(graph, href.slice(1), sourceId);
+  }
+  if (!isFileLinkHref(href)) {
+    return undefined;
+  }
+  const hashIndex = href.lastIndexOf("#");
+  const path = hashIndex < 0 ? href : href.slice(0, hashIndex);
+  const document = resolveDocumentTarget(data, node, sourceId, path);
+  const rootID = document?.topNodeShortIds[0];
+  return rootID && document
+    ? getNodeInSource(graph, { sourceId: document.sourceId, id: rootID })
+    : undefined;
+}
+
+function reciprocalLinks(
+  data: Data,
+  node: GraphNode,
+  sourceId: SourceId
+): ReciprocalLink[] {
+  const graph = graphLookupFromData(data);
+  const source = getNodeInSource(graph, { sourceId, id: node.id });
+  if (!source) return [];
+  const initial: { links: ReciprocalLink[]; targets: string[] } = {
+    links: [],
+    targets: [],
+  };
+  return node.spans.reduce((result, span, index) => {
+    if (span.kind !== "link") return result;
+    const target = reciprocalTarget(data, node, sourceId, span.href);
+    if (!target) return result;
+    const key = nodeRefKey(target.ref);
+    if (result.targets.includes(key)) return result;
+    const reciprocal = findReciprocalLinkItem(graph, data, source, target);
+    if (!reciprocal) return result;
+    return {
+      links: [
+        ...result.links,
+        {
+          spanIndex: index,
+          relevance: reciprocal.relevance,
+          argument: reciprocal.argument,
+        },
+      ],
+      targets: [...result.targets, key],
+    };
+  }, initial).links;
+}
+
+function priorRowRootHref(
+  data: Data,
+  pane: Pane,
+  row: Row,
+  href: string
+): string | undefined {
+  const targetID = embedTargetOf(row.node);
+  if (
+    (!row.demoted && !row.cycle) ||
+    targetID === undefined ||
+    href !== `#${targetID}`
+  ) {
+    return undefined;
+  }
+  const url = buildNodeRouteUrl(
+    row.node.id,
+    row.sourceId,
+    { scrollToId: undefined, fallbackLabel: undefined },
+    data.pull?.coordinatesBySourceId.get(row.sourceId) ??
+      (row.sourceId === pane.sourceId ? pane.routeCoordinate : undefined)
+  );
+  return pane.storageKey !== undefined &&
+    row.sourceId === pane.sourceId &&
+    url.startsWith("/storage/")
+    ? `${url}#key=${encodeURIComponent(pane.storageKey)}`
+    : url;
+}
+
+function InlineLinkSpan({
+  span,
+  node,
+  sourceId,
+  reciprocal,
+}: {
+  span: Extract<InlineSpan, { kind: "link" }>;
+  node: GraphNode;
+  sourceId: SourceId;
+  reciprocal?: ReciprocalLink;
+}): JSX.Element {
+  const data = useData();
+  const navigatePane = useNavigatePane();
+  const pane = useCurrentPane();
+  const row = useRow();
+  const isSearchResult = row.virtualType === "search";
+  // An embed shows the target's live text: the row's own label is the
+  // frozen file record, the display follows the source.
+  const displayedText =
+    row.standsFor !== undefined &&
+    row.presentedSpans !== undefined &&
+    embedTargetOf(node) === row.standsFor.id
+      ? spansText(row.presentedSpans)
+      : span.text;
+  const externalUrl = externalLinkUrl(span.href);
+  const dead = isDeadLinkTarget(data, span.href, node, sourceId);
+  const internalHref = dead
+    ? undefined
+    : priorRowRootHref(data, pane, row, span.href) ??
+      inlineLinkToHref(data, span.href, node, sourceId, span.text);
+  const href = externalUrl ?? internalHref;
+  const style: React.CSSProperties = isSearchResult
+    ? { fontStyle: "italic", textDecoration: "none" }
+    : linkStyleForHref(span.href, dead);
+  const externalPart =
+    !isSearchResult && externalUrl ? (
+      <sup
+        className="incoming-part external-link-part"
+        data-link-furniture="external"
+        aria-hidden="true"
+      >
+        ↗
+      </sup>
+    ) : null;
+  const deadPart = dead ? (
+    <sup
+      className="incoming-part dead-link-part"
+      data-link-furniture="dead"
+      aria-hidden="true"
+    >
+      †
+    </sup>
+  ) : null;
+  if (!href) {
+    return (
+      <>
+        <span
+          role="link"
+          className="inline-link"
+          style={style}
+          data-href={span.href}
+          data-target={span.href}
+          data-link-dead={dead ? "true" : undefined}
+          aria-disabled={dead || undefined}
+          aria-label={
+            dead ? `${displayedText}. Target no longer exists` : undefined
+          }
+        >
+          {displayedText}
+        </span>
+        {externalPart}
+        {deadPart}
+        {reciprocal && (
+          <IncomingPart
+            relevance={reciprocal.relevance}
+            argument={reciprocal.argument}
+            ariaHidden
+          />
+        )}
+      </>
+    );
+  }
+  if (externalUrl) {
+    return (
+      <>
+        <a
+          href={externalUrl}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="inline-link"
+          style={style}
+          data-href={span.href}
+          data-target={span.href}
+          aria-label={`${displayedText} (opens externally)`}
+        >
+          {displayedText}
+        </a>
+        {externalPart}
+      </>
+    );
+  }
+  return (
+    <>
+      <a
+        href={href}
+        className="inline-link"
+        style={style}
+        data-href={span.href}
+        data-target={span.href}
+        onClick={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          navigatePane(href);
+        }}
+        aria-label={`Navigate to ${displayedText}`}
+      >
+        {displayedText}
+      </a>
+      {reciprocal && (
+        <IncomingPart
+          relevance={reciprocal.relevance}
+          argument={reciprocal.argument}
+          ariaHidden
+        />
+      )}
+    </>
+  );
+}
+
+function InlineSpans({
+  node,
+  sourceId,
+}: {
+  node: GraphNode;
+  sourceId: SourceId;
+}): JSX.Element {
+  const data = useData();
+  const reciprocals = reciprocalLinks(data, node, sourceId);
+  return (
+    <span className="break-word">
+      {node.spans.map((span, index) => {
+        const key = `${index}-${span.kind}-${span.text}`;
+        if (span.kind === "link") {
+          return (
+            <InlineLinkSpan
+              key={key}
+              span={span}
+              node={node}
+              sourceId={sourceId}
+              reciprocal={reciprocals.find(
+                (candidate) => candidate.spanIndex === index
+              )}
+            />
+          );
+        }
+        return <React.Fragment key={key}>{span.text}</React.Fragment>;
+      })}
+    </span>
+  );
+}
+
+function hasInlineLinks(node: GraphNode | undefined): node is GraphNode {
+  return !!node && node.spans.some((span) => span.kind === "link");
+}
+
+function NodeContent(): JSX.Element {
+  const row = useRow();
+  const { reference } = row;
+  const displayText = useDisplayText();
+
+  if (row.virtualType === undefined && hasInlineLinks(row.node)) {
+    return <InlineSpans node={row.node} sourceId={row.sourceId} />;
+  }
+
+  if (row.virtualType === "search" && hasInlineLinks(row.node)) {
+    return (
+      <span
+        data-testid="reference-row"
+        style={{ fontStyle: "italic", textDecoration: "none" }}
+      >
+        <InlineSpans node={row.node} sourceId={row.sourceId} />
+      </span>
+    );
+  }
+
+  if (reference) {
+    return <ReferenceContent reference={reference} />;
+  }
+
+  if (hasInlineLinks(row.node)) {
+    return <InlineSpans node={row.node} sourceId={row.sourceId} />;
+  }
+
+  return <span className="break-word">{displayText}</span>;
+}
+
+function getPreviousSiblingFromRows(
+  rows: List<Row>,
+  row: Row
+): Row | undefined {
+  const { childIndex } = row;
+  if (childIndex === undefined || childIndex === 0) {
+    return undefined;
+  }
+  return rows
+    .slice(0, row.index)
+    .reverse()
+    .find(
+      (candidate) =>
+        candidate.childIndex !== undefined &&
+        candidate.parentRef?.sourceId === row.parentRef?.sourceId &&
+        candidate.parentRef?.id === row.parentRef?.id &&
+        candidate.childIndex < childIndex
+    );
+}
+
+function EditableContent({ rows }: { rows: List<Row> }): JSX.Element {
+  const row = useRow();
+  const { parentNode, viewKey, viewPath } = row;
+  const paneIndex = usePaneIndex();
+  const data = useData();
+  const { fetchEntityMetadata } = useApis();
+  const { textStyle } = useItemStyle();
+  const { createPlan, executePlan } = usePlanner();
+  const navigatePane = useNavigatePane();
+  const pane = useCurrentPane();
+  const currentNode = useCurrentNode();
+  const prevSibling = getPreviousSiblingFromRows(rows, row);
+  const parentPath = row.parentViewPath;
+  const viewIsExpanded = useIsExpanded();
+  const nodeIsRoot = useIsRoot();
+  const nodeIndex = useNodeIndex();
+  const isEmptyNode = isEmptyNodeID(row.node.id);
+  const nodeIsExpanded = viewIsExpanded && row.hasChildren;
+
+  const emptyNodeMetadata = computeEmptyNodeMetadata(
+    data.publishEventsStatus.temporaryEvents
+  );
+  const emptyData = parentNode
+    ? emptyNodeMetadata.get(parentNode.id)
+    : undefined;
+  const isRootEmptyNode = isEmptyNode && !parentPath;
+  const shouldAutoFocus =
+    isEmptyNode && (isRootEmptyNode || emptyData?.paneIndex === paneIndex);
+  const escapeFocusPendingRef = React.useRef(false);
+
+  const planWithRowFocusIntent = (plan: Plan, targetViewPath: ViewPath): Plan =>
+    planSetRowFocusIntent(plan, {
+      paneIndex,
+      viewKey: viewPathToString(targetViewPath),
+    });
+
+  const editorSpans = currentNode.spans;
+  const reciprocals = reciprocalLinks(data, row.node, row.sourceId);
+  const deadLinkIndexes = editorSpans.flatMap((span, index) =>
+    span.kind === "link" &&
+    isDeadLinkTarget(data, span.href, row.node, row.sourceId)
+      ? [index]
+      : []
+  );
+  const externalLinkIndexes = editorSpans.flatMap((span, index) =>
+    span.kind === "link" && externalLinkUrl(span.href) ? [index] : []
+  );
+  const handleSave = async (
+    spans: InlineSpan[],
+    submitted?: boolean
+  ): Promise<void> => {
+    const takeResult = ((): [Plan, GraphNode, ViewPath] | undefined => {
+      if (!row.materialize) {
+        return [createPlan(), currentNode, viewPath];
+      }
+      if (
+        !submitted &&
+        spansToMarkdown(spans) === spansToMarkdown(row.node.spans)
+      ) {
+        return undefined;
+      }
+      const [plan, takenNode] = planMaterializeComputedRow(createPlan(), row);
+      return [
+        plan,
+        takenNode,
+        addNodesToLastElement(viewPath, takenNode.id) as ViewPath,
+      ];
+    })();
+    if (!takeResult) {
+      return;
+    }
+    const [materializedStart, takenNode, takenViewPath] = takeResult;
+    const {
+      plan: basePlan,
+      viewPath: updatedViewPath,
+      node: savedNode,
+    } = planSaveNodeAndEnsureNodes(
+      materializedStart,
+      spans,
+      row.materialize ? row.node.id : takenNode.id,
+      takenNode,
+      takenViewPath,
+      parentNode,
+      parentPath,
+      paneIndex
+    );
+    const planWithEscFocus = escapeFocusPendingRef.current
+      ? planWithRowFocusIntent(basePlan, updatedViewPath)
+      : basePlan;
+    // eslint-disable-next-line functional/immutable-data
+    escapeFocusPendingRef.current = false;
+
+    if (!submitted || spansText(spans).trim() === "") {
+      await executePlan(planWithEscFocus);
+      return;
+    }
+
+    const nextPosition = (() => {
+      if (nodeIsRoot || nodeIsExpanded) {
+        return {
+          parentNode: savedNode,
+          parentView: row.view,
+          parentViewPath: updatedViewPath,
+          insertAt: 0,
+        };
+      }
+      if (!parentNode || !parentPath) {
+        return undefined;
+      }
+      const parentRow = getVisibleParentRow(rows, row);
+      if (!parentRow) {
+        return undefined;
+      }
+      // A freshly materialized row has no childIndex; its real position
+      // comes from the plan's current children.
+      const insertAt = (() => {
+        if (nodeIndex !== undefined) return nodeIndex + 1;
+        const parent = getWorkspaceNode(basePlan.knowledgeDBs, parentNode.id);
+        const index = parent ? parent.children.indexOf(savedNode.id) : -1;
+        return index >= 0 ? index + 1 : 0;
+      })();
+      return {
+        parentNode,
+        parentView: parentRow.view,
+        parentViewPath: parentRow.viewPath,
+        insertAt,
+      };
+    })();
+
+    if (!nextPosition) {
+      await executePlan(planWithEscFocus);
+      return;
+    }
+
+    const plan = planSetEmptyNodePosition(
+      basePlan,
+      nextPosition.parentNode.id,
+      nextPosition.parentView,
+      nextPosition.parentViewPath,
+      paneIndex,
+      nextPosition.insertAt
+    );
+    await executePlan(plan);
+  };
+
+  const handleTab = (spans: InlineSpan[]): void => {
+    if (!isEmptyNode && !isEditableNode(currentNode)) return;
+
+    const basePlan = createPlan();
+    const trimmedText = spansText(spans).trim();
+
+    if (isEmptyNode) {
+      if (!prevSibling || !parentPath) return;
+      // Indenting onto a computed row takes it first.
+      const [planMaterialized, takenPrevSibling] = planMaterializeComputedRow(
+        basePlan,
+        prevSibling
+      );
+      const takenViewPath = addNodesToLastElement(
+        prevSibling.viewPath,
+        takenPrevSibling.id
+      );
+      const planWithoutEmpty = parentNode
+        ? planRemoveEmptyNodePosition(planMaterialized, parentNode.id)
+        : planMaterialized;
+      const planWithExpand = planExpandNode(
+        planWithoutEmpty,
+        prevSibling.view,
+        takenViewPath
+      );
+
+      if (trimmedText) {
+        executePlan(
+          planAddSpansToParent(
+            planWithExpand,
+            spans,
+            takenPrevSibling,
+            undefined,
+            undefined,
+            undefined
+          )
+        );
+      } else {
+        executePlan(
+          planSetEmptyNodePosition(
+            planWithExpand,
+            takenPrevSibling.id,
+            prevSibling.view,
+            takenViewPath,
+            paneIndex,
+            0
+          )
+        );
+      }
+      return;
+    }
+
+    const result = planBatchIndent(basePlan, [row], rows, {
+      spans,
+      viewKey,
+    });
+    if (result) executePlan(result);
+  };
+
+  const handleShiftTab = (spans: InlineSpan[]): void => {
+    const basePlan = createPlan();
+    const trimmedText = spansText(spans).trim();
+
+    if (isEmptyNode) {
+      if (!parentPath) return;
+      const parentRow = getVisibleParentRow(rows, row);
+      if (!parentRow?.parentNode) return;
+      const grandParentRow = getVisibleParentRow(rows, parentRow);
+      if (!grandParentRow) return;
+      const parentNodeIndex = row.parentChildIndex;
+      if (parentNodeIndex === undefined) return;
+
+      const planWithoutEmpty = parentNode
+        ? planRemoveEmptyNodePosition(basePlan, parentNode.id)
+        : basePlan;
+
+      if (!trimmedText) {
+        executePlan(
+          planSetEmptyNodePosition(
+            planWithoutEmpty,
+            parentRow.parentNode.id,
+            grandParentRow.view,
+            grandParentRow.viewPath,
+            paneIndex,
+            parentNodeIndex + 1
+          )
+        );
+        return;
+      }
+
+      executePlan(
+        planAddSpansToParent(
+          planWithoutEmpty,
+          spans,
+          parentRow.parentNode,
+          parentNodeIndex + 1,
+          undefined,
+          undefined
+        )
+      );
+      return;
+    }
+
+    if (!isEditableNode(currentNode)) return;
+
+    const result = planBatchOutdent(basePlan, [row], rows, {
+      spans,
+      viewKey,
+    });
+    if (result) executePlan(result);
+  };
+
+  const handleRequestRowFocus = ({
+    viewKey: targetViewKey,
+    nodeId,
+    rowIndex,
+  }: {
+    viewKey?: string;
+    nodeId?: string;
+    rowIndex?: number;
+  }): void => {
+    const focusTargetNodeId =
+      nodeId && !isEmptyNodeID(nodeId) ? nodeId : undefined;
+    if (
+      targetViewKey === undefined &&
+      focusTargetNodeId === undefined &&
+      rowIndex === undefined
+    ) {
+      return;
+    }
+    const focusPlan = planSetRowFocusIntent(createPlan(), {
+      paneIndex,
+      viewKey: targetViewKey,
+      nodeId: focusTargetNodeId,
+      rowIndex,
+    });
+    executePlan(focusPlan);
+  };
+
+  const handlePasteMultiLine = (
+    children: ParsedLine[],
+    currentSpans: InlineSpan[]
+  ): void => {
+    const { plan: basePlan, node: savedNode } = planSaveNodeAndEnsureNodes(
+      createPlan(),
+      currentSpans,
+      row.node.id,
+      currentNode,
+      viewPath,
+      parentNode,
+      parentPath,
+      paneIndex
+    );
+    const trees = parsedLinesToTrees(children);
+    if (!parentNode || !parentPath) {
+      executePlan(planPasteMarkdownTrees(basePlan, trees, savedNode, 0));
+      return;
+    }
+    const insertAt = nodeIndex !== undefined ? nodeIndex + 1 : 0;
+    executePlan(planPasteMarkdownTrees(basePlan, trees, parentNode, insertAt));
+  };
+
+  const handleDelete = (): void => {
+    if (!parentNode) {
+      return;
+    }
+    const plan = planDisconnectFromParent(
+      createPlan(),
+      parentNode.id,
+      row.node.id
+    );
+    executePlan(plan);
+  };
+
+  const handleEscapeRequest = (): void => {
+    // eslint-disable-next-line functional/immutable-data
+    escapeFocusPendingRef.current = true;
+  };
+
+  // Handle closing empty node editor (Escape with no text)
+  const handleClose = (): void => {
+    if (!isEmptyNode || !parentPath) return;
+    const plan = createPlan();
+    if (parentNode) {
+      executePlan(planRemoveEmptyNodePosition(plan, parentNode.id));
+    }
+  };
+
+  if (!isEmptyNode && !isEditableNode(currentNode)) {
+    return <NodeContent />;
+  }
+
+  const handleActivateLink = async (
+    href: string,
+    spans: InlineSpan[]
+  ): Promise<void> => {
+    const externalUrl = externalLinkUrl(href);
+    if (externalUrl) {
+      handleSave(spans);
+      window.open(externalUrl, "_blank", "noopener,noreferrer");
+      return;
+    }
+    await handleSave(spans);
+    const fallbackLabel = spans.find(
+      (span) => span.kind === "link" && span.href === href
+    )?.text;
+    const targetHref =
+      priorRowRootHref(data, pane, row, href) ??
+      inlineLinkToHref(data, href, row.node, row.sourceId, fallbackLabel);
+    if (targetHref) navigatePane(targetHref);
+  };
+
+  return (
+    <>
+      <MiniEditor
+        key={`${viewPathToString(viewPath)}:${nodeIndex}`}
+        initialSpans={editorSpans}
+        reciprocalLinks={reciprocals}
+        deadLinkIndexes={deadLinkIndexes}
+        externalLinkIndexes={externalLinkIndexes}
+        style={textStyle}
+        onSave={handleSave}
+        onTab={handleTab}
+        onShiftTab={handleShiftTab}
+        onClose={isEmptyNode ? handleClose : undefined}
+        autoFocus={shouldAutoFocus}
+        ariaLabel={
+          isEmptyNode ? "new node editor" : `edit ${spansText(editorSpans)}`
+        }
+        onEscape={handleEscapeRequest}
+        onRequestRowFocus={handleRequestRowFocus}
+        onDelete={isEmptyNode ? undefined : handleDelete}
+        onPasteMultiLine={handlePasteMultiLine}
+        onActivateLink={handleActivateLink}
+        entityPicker={{ fetchEntityMetadata }}
+      />
+    </>
+  );
+}
+
+function InteractiveNodeContent({ rows }: { rows: List<Row> }): JSX.Element {
+  const row = useRow();
+  const { virtualType, reference } = row;
+  const currentNode = useCurrentNode();
+  const isLoading = useNodeIsLoading();
+  const isInSearchView = useIsInSearchView();
+  const isViewingOtherUserContent = useIsViewingOtherUserContent();
+  const isEmptyNode = isEmptyNodeID(row.node.id);
+  const displayText = useDisplayText();
+
+  const isReadonly =
+    isInSearchView ||
+    isViewingOtherUserContent ||
+    virtualType !== undefined ||
+    row.projected === true;
+
+  if (isLoading) {
+    return <LoadingNode />;
+  }
+
+  // For empty placeholder nodes, render EditableContent only if not readonly
+  if (isEmptyNode) {
+    return isReadonly ? <></> : <EditableContent rows={rows} />;
+  }
+
+  if (!currentNode && !reference && displayText === "") {
+    return <ErrorContent />;
+  }
+
+  const embedTargetID = embedTargetOf(row.node);
+  const displaysLiveTarget =
+    embedTargetID !== undefined && !isEntityId(embedTargetID);
+
+  if (isEditableNode(currentNode) && !isReadonly && !displaysLiveTarget) {
+    return <EditableContent rows={rows} />;
+  }
+
+  // Read-only content
+  return <NodeContent />;
+}
+
+export const INDENTATION = 25;
+const ARROW_WIDTH = 0;
+
+function Indent({
+  levels,
+  colorLevels,
+}: {
+  levels: number;
+  colorLevels?: number;
+}): JSX.Element {
+  return (
+    <>
+      {Array.from(Array(levels).keys()).map((k) => {
+        const marginLeft = k === 0 ? 5 : ARROW_WIDTH;
+        const width = k === 0 ? 0 : INDENTATION;
+        const levelsFromRight = levels - k;
+        const showBorder =
+          colorLevels !== undefined && levelsFromRight === colorLevels;
+
+        return (
+          <div
+            key={k}
+            className={`indent-spacer${showBorder ? " indent-border" : ""}`}
+            style={{
+              marginLeft,
+              minWidth: width,
+            }}
+          />
+        );
+      })}
+    </>
+  );
+}
+
+// Incoming references speak ↩ everywhere — the gutter, the filter button,
+// the link cluster. Never a judgment symbol: nobody judged anything.
+function IncomingRefGutterIndicator(): JSX.Element {
+  return (
+    <span
+      className="incoming-indicator"
+      title="Incoming link — judge it (! ? ~ + -) to place it"
+      aria-hidden="true"
+    >
+      ↩
+    </span>
+  );
+}
+
+export function Node({
+  className,
+  cardBodyClassName,
+  rows,
+}: {
+  className?: string;
+  cardBodyClassName?: string;
+  rows: List<Row>;
+}): JSX.Element | null {
+  const row = useRow();
+  const levels = getLevels(row.viewPath);
+  const searchDepth = useSearchDepth();
+  const { cardStyle, textStyle, textClassName, relevance } = useItemStyle();
+  const cls =
+    className !== undefined ? `${className} hover-light-bg` : "hover-light-bg";
+  const clsBody = cardBodyClassName || "ps-0";
+
+  const { virtualType } = row;
+  const currentNode = useCurrentNode();
+  const calendarType = (() => {
+    if (virtualType !== undefined) return undefined;
+    const presented = row.presentedSpans ?? currentNode.spans;
+    if (feedUrlInSpans(presented) !== undefined) return "Calendar";
+    return isCalendarEntryId(row.standsFor?.id ?? currentNode.id)
+      ? "Date"
+      : undefined;
+  })();
+  const isViewingOtherUser = useIsViewingOtherUserContent();
+  const node = row.reference;
+  const isOtherUser = (node && node.sourceId !== LOCAL) || isViewingOtherUser;
+
+  const { hasChildren } = row;
+
+  const contentClass = "";
+
+  return (
+    <NodeCard
+      className={cls}
+      cardBodyClassName={clsBody}
+      style={cardStyle}
+      data-virtual-type={virtualType}
+      data-other-user={isOtherUser ? "true" : undefined}
+    >
+      <div className="indicator-gutter">
+        {virtualType === "incoming" && <IncomingRefGutterIndicator />}
+        {relevance === "relevant" && (
+          <span
+            className="relevant-indicator"
+            title="Relevant"
+            aria-hidden="true"
+          >
+            !
+          </span>
+        )}
+        {relevance === "maybe_relevant" && (
+          <span
+            className="maybe-relevant-indicator"
+            title="Maybe Relevant"
+            aria-hidden="true"
+          >
+            ?
+          </span>
+        )}
+        {relevance === "little_relevant" && (
+          <span
+            className="little-relevant-indicator"
+            title="Little Relevant"
+            aria-hidden="true"
+          >
+            ~
+          </span>
+        )}
+      </div>
+      {levels > 0 && <Indent levels={levels} colorLevels={searchDepth} />}
+      {hasChildren && <ExpandCollapseToggle />}
+      {!hasChildren && (
+        <span
+          className="node-marker"
+          aria-hidden="true"
+          data-testid="node-marker"
+        />
+      )}
+      <EditorTextProvider>
+        <div className={`w-100 node-content-wrapper ${contentClass}`}>
+          <span className={textClassName} style={textStyle}>
+            {calendarType && (
+              <span
+                className="calendar-type-indicator"
+                title={calendarType}
+                aria-hidden="true"
+              >
+                {calendarType === "Calendar" ? "🗓︎" : "📅︎"}
+              </span>
+            )}
+            <InteractiveNodeContent rows={rows} />
+          </span>
+        </div>
+        <RightMenu />
+      </EditorTextProvider>
+    </NodeCard>
+  );
+}
+
+export const NOTE_TYPE = "note";

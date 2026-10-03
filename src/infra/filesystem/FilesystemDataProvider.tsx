@@ -1,56 +1,126 @@
 import React from "react";
-import { Map } from "immutable";
-import { useUserOrAnon } from "../../NostrAuthContext";
+import { List, Map } from "immutable";
+import { useUser } from "../../NostrAuthContext";
 import { useUserSessionState } from "../../userSessionState";
+import { useBackend } from "../../BackendContext";
 import { DataContextProvider, MergeKnowledgeDB } from "../../DataContext";
-import { DocumentStoreProvider } from "../../DocumentStore";
+import { DocumentStoreProvider, ParsedDocument } from "../../DocumentStore";
+import { LOCAL } from "../../core/nodeRef";
 import { PlanningContextProvider } from "../../planner";
 import { FilesystemExecutorProvider } from "./FilesystemExecutorProvider";
 import { NavigationStateProvider } from "../../NavigationStateContext";
-import { createEmptySemanticIndex } from "../../semanticIndex";
-import { FilesystemWorkspaceLoader } from "./FilesystemWorkspaceLoader";
+import { createEmptyGraphIndex } from "../../graphIndex";
 import { FilesystemWatcher } from "./FilesystemWatcher";
+import { parseToDocument } from "../../core/Document";
+import { WalkContext } from "../../core/markdownNodes";
+import { WorkspaceMarkdownFile } from "./workspaceBackend";
+import { PullSourceProvider } from "../../PullSourceContext";
+
+function fallbackTitleFromRelativePath(relativePath: string): string {
+  const pieces = relativePath.split(/[\\/]/);
+  const filename = pieces[pieces.length - 1] ?? relativePath;
+  return filename.endsWith(".md") ? filename.slice(0, -3) : filename;
+}
+
+function assertUniqueDocIds(documents: ReadonlyArray<ParsedDocument>): void {
+  const counts = documents.reduce(
+    (acc, parsed) =>
+      acc.set(parsed.document.docId, (acc.get(parsed.document.docId) ?? 0) + 1),
+    Map<string, number>()
+  );
+  const duplicates = counts
+    .entrySeq()
+    .filter(([, count]) => count > 1)
+    .map(([docId]) => docId)
+    .sort()
+    .toArray();
+  if (duplicates.length > 0) {
+    throw new Error(
+      `Workspace contains duplicate knowstr_doc_id values: ${duplicates.join(
+        ", "
+      )}`
+    );
+  }
+}
+
+function parseWorkspaceFiles(
+  files: ReadonlyArray<WorkspaceMarkdownFile>
+): ReadonlyArray<ParsedDocument> {
+  const result = files.reduce<{
+    documents: List<ParsedDocument>;
+    context: WalkContext | undefined;
+  }>(
+    (acc, file) => {
+      const fallbackTitle = fallbackTitleFromRelativePath(file.relativePath);
+      const parsed = parseToDocument(LOCAL, file.currentContent, {
+        filePath: file.relativePath,
+        relativePath: file.relativePath,
+        ...(fallbackTitle !== "" ? { fallbackTitle } : {}),
+        ...(acc.context !== undefined ? { context: acc.context } : {}),
+      });
+      return {
+        documents: acc.documents.push({
+          document: parsed.document,
+          nodes: parsed.nodes,
+        }),
+        context: parsed.context,
+      };
+    },
+    { documents: List<ParsedDocument>(), context: undefined }
+  );
+  const documents = result.documents.toArray();
+  assertUniqueDocIds(documents);
+  return documents;
+}
 
 export function FilesystemDataProvider({
   children,
 }: {
   children: React.ReactNode;
 }): JSX.Element {
-  const user = useUserOrAnon();
+  const user = useUser();
   const session = useUserSessionState(user);
+  const { workspace } = useBackend();
+  const workspaceKey = workspace?.profile?.workspaceDir ?? "no-workspace";
+  const initialDocuments = React.useMemo(
+    () => parseWorkspaceFiles(workspace?.files ?? []),
+    [workspace?.files]
+  );
 
   return (
     <DataContextProvider
-      contacts={Map()}
       user={user}
-      contactsRelays={Map()}
-      knowledgeDBs={Map<PublicKey, KnowledgeData>()}
-      semanticIndex={createEmptySemanticIndex()}
-      relaysInfos={Map()}
+      knowledgeDBs={Map<SourceId, KnowledgeData>()}
+      graphIndex={createEmptyGraphIndex()}
+      documents={Map()}
+      documentByFilePath={Map()}
       publishEventsStatus={session.publishStatus}
-      snapshotNodes={Map()}
       views={session.views}
       panes={session.panes}
     >
       <DocumentStoreProvider
+        key={workspaceKey}
+        localPubkey={user?.publicKey}
+        initialDocuments={initialDocuments}
         unpublishedEvents={session.publishStatus.unsignedEvents}
       >
-        <FilesystemWorkspaceLoader />
         <FilesystemWatcher />
         <MergeKnowledgeDB>
-          <FilesystemExecutorProvider
-            setPublishEvents={session.setPublishStatus}
-            setPanes={session.setPanes}
-            setViews={session.setViews}
-          >
-            <PlanningContextProvider
+          <PullSourceProvider>
+            <FilesystemExecutorProvider
               setPublishEvents={session.setPublishStatus}
               setPanes={session.setPanes}
               setViews={session.setViews}
             >
-              <NavigationStateProvider>{children}</NavigationStateProvider>
-            </PlanningContextProvider>
-          </FilesystemExecutorProvider>
+              <PlanningContextProvider
+                setPublishEvents={session.setPublishStatus}
+                setPanes={session.setPanes}
+                setViews={session.setViews}
+              >
+                <NavigationStateProvider>{children}</NavigationStateProvider>
+              </PlanningContextProvider>
+            </FilesystemExecutorProvider>
+          </PullSourceProvider>
         </MergeKnowledgeDB>
       </DocumentStoreProvider>
     </DataContextProvider>

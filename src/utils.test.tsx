@@ -1,6 +1,4 @@
 import React from "react";
-// eslint-disable-next-line import/no-unresolved
-import { RelayInformation } from "nostr-tools/lib/types/nip11";
 import { List, Map, Set, OrderedSet } from "immutable";
 import {
   cleanup,
@@ -27,46 +25,50 @@ import userEvent from "@testing-library/user-event";
 import { bytesToHex, hexToBytes } from "@noble/hashes/utils";
 import { sha256 } from "@noble/hashes/sha256";
 import { schnorr } from "@noble/curves/secp256k1";
-import { VirtuosoMockContext } from "react-virtuoso";
-import { KIND_CONTACTLIST } from "./nostr";
-import { createPlan, planUpsertContact, planRemoveContact } from "./planner";
-import { execute } from "./infra/nostr/executor";
+import { LOCAL } from "./core/nodeRef";
 import { ApiProvider, Apis, FinalizeEvent } from "./Apis";
 import { Backend } from "./BackendContext";
 import { NostrBackendProvider } from "./infra/nostr/NostrBackendProvider";
 import { NostrDataProvider } from "./infra/nostr/NostrDataProvider";
 import { App } from "./App";
-import { DataContextProps } from "./DataContext";
-import { MockRelayPool, mockRelayPool } from "./nostrMock.test";
+import { CalendarFeedProvider } from "./CalendarFeedContext";
 import {
-  isUserLoggedInWithSeed,
-  UNAUTHENTICATED_USER_PK,
-} from "./NostrAuthContext";
+  MockRelayPool,
+  mockRelayPool,
+  registerStorageDecryptUsers,
+} from "./nostrMock.test";
+import { isUserLoggedInWithSeed } from "./NostrAuthContext";
 import { AuthProvider } from "./AuthProvider";
-import { EMPTY_SEMANTIC_ID } from "./connections";
-import { RootViewContextProvider } from "./ViewContext";
-import { LoadSearchData } from "./LoadSearchData";
-import { StorePreLoginContext } from "./StorePreLoginContext";
-import { TemporaryViewProvider } from "./components/TemporaryViewContext";
-import { PaneView } from "./components/Workspace";
+import { nodeText } from "./core/nodeSpans";
+import { TemporaryViewProvider } from "./editor/temporaryViewState";
+import { PaneView } from "./editor/Workspace";
+import { PaneRootViewProvider } from "./editor/SplitPaneLayout";
 import { DND } from "./dnd";
 import {
   computeDepthLimits,
   setDropIndentDepth,
-} from "./components/DroppableContainer";
-import { findContacts } from "./contacts";
-import { UserRelayContextProvider } from "./UserRelayContext";
+} from "./editor/DroppableContainer";
 import { StashmapDB } from "./infra/nostr/cache/indexedDB";
-import { createEmptySemanticIndex } from "./semanticIndex";
-
+import { createEmptyGraphIndex } from "./graphIndex";
+import { buildCoordinateRouteUrl, buildNodeRouteUrl } from "./navigationUrl";
+import { decodePublicKeyInputSync } from "./infra/nostr/publicKeys";
+import { processEvents } from "./eventProcessing";
+import { KIND_KNOWLEDGE_DOCUMENT } from "./nostr";
 import {
-  PaneIndexProvider,
-  useCurrentPane,
-  usePaneIndex,
-} from "./SplitPanesContext";
+  buildStorageEnvelope,
+  decryptStorageEvent,
+  newStorageKey,
+} from "./storageEncryption";
+
+import { PaneIndexProvider } from "./SplitPanesContext";
 
 // eslint-disable-next-line @typescript-eslint/no-empty-function
 test.skip("skip", () => {});
+
+const TestListViewportContext = React.createContext({
+  viewportHeight: 10000,
+  itemHeight: 100,
+});
 
 export const ALICE_PRIVATE_KEY =
   "04d22f1cf58c28647c7b7dc198dcbc4de860948933e56001ab9fc17e1b8d072e";
@@ -82,17 +84,11 @@ const CAROL_PRIVATE_KEY =
 export const CAROL_PUBLIC_KEY =
   "074eb94a7a3d34102b563b540ac505e4fa8f71e3091f1e39a77d32e813c707d2" as PublicKey;
 
-const UNAUTHENTICATED_ALICE: Contact = {
-  publicKey:
-    "f0289b28573a7c9bb169f43102b26259b7a4b758aca66ea3ac8cd0fe516a3758" as PublicKey,
-};
-
-export const ANON: User = {
-  publicKey: UNAUTHENTICATED_USER_PK,
-};
+export const ANON: User | undefined = undefined;
 
 const ALICE: User = {
-  publicKey: UNAUTHENTICATED_ALICE.publicKey,
+  publicKey:
+    "f0289b28573a7c9bb169f43102b26259b7a4b758aca66ea3ac8cd0fe516a3758" as PublicKey,
   privateKey: hexToBytes(ALICE_PRIVATE_KEY),
 };
 
@@ -105,6 +101,8 @@ export const CAROL: User = {
   publicKey: CAROL_PUBLIC_KEY,
   privateKey: hexToBytes(CAROL_PRIVATE_KEY),
 };
+
+registerStorageDecryptUsers([ALICE, BOB, CAROL]);
 
 export const TEST_RELAYS = [
   { url: "wss://relay.test.first.success/", read: true, write: true },
@@ -159,6 +157,58 @@ export function mockFinalizeEvent(): FinalizeEvent {
     finalizeEventWithoutWasm(t, secretKey);
 }
 
+// Wire storage events are encrypted; fixtures that represent relay state
+// must be too. Encrypts the event's content under a fresh (or given)
+// storage key wrapped for the author.
+export async function encryptStorageEventForTest<T extends { content: string }>(
+  author: User,
+  event: T,
+  storageKey: string = newStorageKey()
+): Promise<T> {
+  return {
+    ...event,
+    content: await buildStorageEnvelope(author, storageKey, event.content),
+  };
+}
+
+// Opens wire storage events the way the app does — as the author or through
+// capability keys — so tests can assert on published plaintext.
+export async function decryptStorageEventsForTest(
+  reader: User,
+  events: ReadonlyArray<Event | UnsignedEvent>,
+  capabilityKeys: ReadonlyArray<string> = []
+): Promise<Array<(Event | UnsignedEvent) & EventAttachment>> {
+  const opened = await Promise.all(
+    events.map((event) => decryptStorageEvent(event, reader, capabilityKeys))
+  );
+  return opened.filter(
+    (event): event is (Event | UnsignedEvent) & EventAttachment =>
+      event !== undefined
+  );
+}
+
+// The capability a share link would carry: the storage key of the author's
+// newest wire event for the document.
+export async function storageKeyForTest(
+  author: User,
+  events: ReadonlyArray<Event | UnsignedEvent>,
+  docId: string
+): Promise<string> {
+  const opened = await decryptStorageEventsForTest(
+    author,
+    events.filter(
+      (event) =>
+        event.kind === KIND_KNOWLEDGE_DOCUMENT &&
+        event.tags.some((tag) => tag[0] === "d" && tag[1] === docId)
+    )
+  );
+  const newest = opened[opened.length - 1];
+  if (!newest?.storageKey) {
+    throw new Error(`No storage key found for document ${docId}`);
+  }
+  return newest.storageKey;
+}
+
 type TestApis = Omit<Apis, "fileStore" | "relayPool"> & {
   fileStore: MockFileStore;
   relayPool: MockRelayPool;
@@ -172,23 +222,17 @@ function applyApis(props?: Partial<TestApis>): TestApis {
       relayPool.subscribeMany(relays, filters, params),
     publish: (relays, event) => relayPool.publish(relays, event),
     user: undefined,
-    defaultRelays: [] as Relays,
+    workspaceConfig: {
+      storageRelays: TEST_RELAYS.map((relay) => relay.url),
+      roomRelays: [],
+    },
   };
   return {
     eventLoadingTimeout: 0,
-    timeToStorePreLoginEvents: 0,
     fileStore: props?.fileStore || mockFileStore(),
     relayPool,
     backend,
     finalizeEvent: props?.finalizeEvent || mockFinalizeEvent(),
-    nip11: props?.nip11 || {
-      searchDebounce: 0,
-      fetchRelayInformation: jest.fn().mockReturnValue(
-        Promise.resolve({
-          suppported_nips: [],
-        })
-      ),
-    },
     ...props,
   };
 }
@@ -197,22 +241,19 @@ export type UpdateState = () => TestAppState;
 
 type TestAppState = TestDataProps & TestApis;
 
-type TestDataProps = DataContextProps & {
-  relays: AllRelays;
-};
+type TestDataProps = Data;
 
 const DEFAULT_DATA_CONTEXT_PROPS: TestDataProps = {
   user: ALICE,
-  contacts: Map<PublicKey, Contact>(),
-  contactsRelays: Map<PublicKey, Relays>(),
-  knowledgeDBs: Map<PublicKey, KnowledgeData>(),
-  semanticIndex: createEmptySemanticIndex(),
-  relaysInfos: Map<string, RelayInformation | undefined>(),
+  knowledgeDBs: Map<SourceId, KnowledgeData>(),
+  graphIndex: createEmptyGraphIndex(),
+  documents: Map(),
+  documentByFilePath: Map(),
+  computedNodes: Map(),
   publishEventsStatus: {
     isLoading: false,
-    unsignedEvents: List<UnsignedEvent>(),
+    unsignedEvents: List<UnsignedEvent & EventAttachment>(),
     results: Map<string, PublishResultsOfEvent>(),
-    preLoginEvents: List<UnsignedEvent>(),
     temporaryView: {
       rowFocusIntents: Map<number, RowFocusIntent>(),
       baseSelection: OrderedSet<string>(),
@@ -224,14 +265,8 @@ const DEFAULT_DATA_CONTEXT_PROPS: TestDataProps = {
     },
     temporaryEvents: List(),
   },
-  snapshotNodes: Map(),
   views: Map<string, View>(),
-  relays: {
-    defaultRelays: [{ url: "wss://default.relay", read: true, write: true }],
-    userRelays: [{ url: "wss://user.relay", read: true, write: true }],
-    contactsRelays: [{ url: "wss://contacts.relay", read: true, write: true }],
-  },
-  panes: [{ id: "pane-0", stack: [], author: ALICE.publicKey }],
+  panes: [{ id: "pane-0", sourceId: LOCAL }],
 };
 
 export function applyDefaults(props?: Partial<TestAppState>): TestAppState {
@@ -242,67 +277,165 @@ export function applyDefaults(props?: Partial<TestAppState>): TestAppState {
   };
 }
 
-function createContactsQuery(author: PublicKey): Filter {
-  return {
-    kinds: [KIND_CONTACTLIST],
-    authors: [author],
-  };
-}
-
-function getContactListEventsOfUser(
-  publicKey: PublicKey,
-  events: Array<Event>
-): List<Event> {
-  const query = createContactsQuery(publicKey);
-  return List<Event>(events).filter((e) => matchFilter(query, e));
-}
-
-function getContacts(appState: TestAppState): Contacts {
-  const events = getContactListEventsOfUser(
-    appState.user.publicKey,
-    appState.relayPool.getEvents()
-  );
-  return findContacts(events);
+export function requireUser(state: TestAppState): User {
+  if (!state.user) {
+    throw new Error("Test requires a logged-in user");
+  }
+  return state.user;
 }
 
 export function setup(
-  users: User[],
+  users: (User | undefined)[],
   options?: Partial<TestAppState>
 ): UpdateState[] {
   const appState = applyDefaults(options);
   return users.map((user): UpdateState => {
-    return (): TestAppState => {
-      const updatedState = {
-        ...appState,
-        user,
-      };
-      const contacts = appState.contacts.merge(getContacts(updatedState));
-      return {
-        ...updatedState,
-        contacts,
-      };
-    };
+    return (): TestAppState => ({
+      ...appState,
+      user,
+    });
   });
 }
 
 type ProviderComponent = React.ComponentType<{ children: React.ReactNode }>;
 
 type RenderApis = Partial<TestApis> &
-  Partial<DataContextProps> & {
+  Partial<TestDataProps> & {
     initialRoute?: string;
     user?: User;
-    defaultRelays?: Array<string>;
+    storageRelays?: Array<string>;
+    roomRelays?: Array<string>;
     initialStack?: ID[];
     db?: StashmapDB | null;
     BackendProvider?: ProviderComponent;
     DataProvider?: ProviderComponent;
+    // The storage key a share link handed this session — appended to the
+    // resolved route's fragment instead of digging the relay shadow.
+    capabilityKey?: string;
   };
+
+function normalizeTestInitialRoute(
+  route: string,
+  options?: RenderApis
+): string {
+  const [pathname, search = ""] = route.split("?");
+  if (!pathname.startsWith("/n/") || !options?.knowledgeDBs) {
+    return route;
+  }
+  const segments = pathname
+    .split("/")
+    .filter((segment) => segment !== "" && segment !== "n")
+    .map(decodeURIComponent);
+  if (segments.length === 0) {
+    return route;
+  }
+
+  const querySource = new URLSearchParams(search).get("source");
+  const decodedSource = decodePublicKeyInputSync(querySource || "");
+  const sourceId: SourceId = decodedSource ?? querySource ?? LOCAL;
+  const eventAuthor =
+    querySource && querySource !== LOCAL
+      ? decodedSource ?? (querySource as PublicKey)
+      : options.user?.publicKey || ALICE.publicKey;
+  const eventKnowledgeDB = options.relayPool
+    ? processEvents(List(options.relayPool.getDecryptedEvents())).get(
+        eventAuthor
+      )?.knowledgeDB
+    : undefined;
+  const nodes =
+    options.knowledgeDBs.get(sourceId)?.nodes || eventKnowledgeDB?.nodes;
+  const targetNode = segments.reduce<GraphNode | undefined>(
+    (parentNode, segment, index) => {
+      if (index > 0 && !parentNode) {
+        return undefined;
+      }
+      return nodes?.valueSeq().find((candidate) => {
+        if (nodeText(candidate) !== segment) {
+          return false;
+        }
+        if (index === 0) {
+          return candidate.parent === undefined;
+        }
+        return candidate.parent === parentNode?.id;
+      });
+    },
+    undefined
+  );
+  if (!targetNode) {
+    return route;
+  }
+  const url = buildNodeRouteUrl(targetNode.id, querySource ?? LOCAL, {
+    scrollToId: undefined,
+    fallbackLabel: undefined,
+  });
+  if (!querySource || querySource === LOCAL) {
+    return url;
+  }
+  // A foreign source needs the capability a share link would carry: the
+  // one handed in (obtained through the audience chip), or — for tests
+  // exercising other features — the storage key dug from the relay shadow.
+  const rootNode =
+    targetNode.id === targetNode.root
+      ? targetNode
+      : nodes?.get(targetNode.root);
+  const docId = rootNode?.docId ?? rootNode?.id;
+  const capability =
+    options.capabilityKey ??
+    options.relayPool
+      ?.getDecryptedEvents()
+      .filter(
+        (event) =>
+          event.kind === KIND_KNOWLEDGE_DOCUMENT &&
+          event.pubkey === eventAuthor &&
+          event.tags.some((tag) => tag[0] === "d" && tag[1] === docId)
+      )
+      .map((event) => event.storageKey)
+      .filter((key): key is string => key !== undefined)
+      .pop();
+  const routeAuthor = decodePublicKeyInputSync(eventAuthor);
+  if (!capability || !docId || !routeAuthor) {
+    return url;
+  }
+  const sourceRelays = options.relayPool
+    ?.getEvents()
+    .filter(
+      (event) =>
+        event.kind === KIND_KNOWLEDGE_DOCUMENT &&
+        event.pubkey === eventAuthor &&
+        event.tags.some((tag) => tag[0] === "d" && tag[1] === docId)
+    )
+    .flatMap((event) => event.relays ?? [])
+    .filter((relay, index, relays) => relays.indexOf(relay) === index);
+  return buildCoordinateRouteUrl(
+    "storage",
+    {
+      eventKind: KIND_KNOWLEDGE_DOCUMENT,
+      pubkey: routeAuthor,
+      dTag: docId,
+      relays:
+        sourceRelays && sourceRelays.length > 0
+          ? sourceRelays
+          : options.storageRelays ?? TEST_RELAYS.map((relay) => relay.url),
+    },
+    targetNode.id,
+    capability
+  );
+}
+
+function normalizedTestUser(user: User | undefined): User | undefined {
+  if (!user) {
+    return undefined;
+  }
+  return isUserLoggedInWithSeed(user)
+    ? { privateKey: user.privateKey, publicKey: user.publicKey }
+    : { publicKey: user.publicKey };
+}
 
 export function renderApis(
   children: React.ReactElement,
   options?: RenderApis
 ): TestApis & RenderResult {
-  const { fileStore, relayPool, backend, finalizeEvent, nip11 } =
+  const { fileStore, relayPool, backend, finalizeEvent, fetchEntityMetadata } =
     applyApis(options);
 
   // If user is explicity undefined it will be overwritten, if not set default Alice is used
@@ -310,26 +443,31 @@ export function renderApis(
     user: ALICE,
     ...options,
   };
-  const user =
-    optionsWithDefaultUser.user &&
-    isUserLoggedInWithSeed(optionsWithDefaultUser.user)
-      ? {
-          privateKey: optionsWithDefaultUser.user.privateKey,
-          publicKey: optionsWithDefaultUser.user.publicKey,
-        }
-      : undefined;
-  if (user && user.publicKey && !user.privateKey) {
-    fileStore.setLocalStorage("publicKey", user.publicKey);
-  } else if (user && user.privateKey) {
+  const user = normalizedTestUser(optionsWithDefaultUser.user);
+  if (user && isUserLoggedInWithSeed(user)) {
     fileStore.setLocalStorage("privateKey", bytesToHex(user.privateKey));
+  } else if (user) {
+    fileStore.setLocalStorage("publicKey", user.publicKey);
   }
-  window.history.pushState({}, "", options?.initialRoute || "/");
-  const defaultRelayUrls =
-    optionsWithDefaultUser.defaultRelays || TEST_RELAYS.map((r) => r.url);
+  window.history.pushState(
+    {},
+    "",
+    normalizeTestInitialRoute(options?.initialRoute || "/", options)
+  );
+  const storageRelays =
+    optionsWithDefaultUser.storageRelays ??
+    TEST_RELAYS.map((relay) => relay.url);
+  const roomRelays = optionsWithDefaultUser.roomRelays ?? [];
   const BackendProviderComponent =
     options?.BackendProvider ??
     (({ children: c }: { children: React.ReactNode }) => (
-      <NostrBackendProvider defaultRelayUrls={defaultRelayUrls}>
+      <NostrBackendProvider
+        initialWorkspaceConfig={{
+          storageRelays,
+          roomRelays,
+        }}
+        db={options?.db ?? null}
+      >
         {c}
       </NostrBackendProvider>
     ));
@@ -341,24 +479,28 @@ export function renderApis(
           fileStore,
           relayPool,
           finalizeEvent,
-          nip11,
           eventLoadingTimeout: 0,
-          timeToStorePreLoginEvents: 0,
+          ...(options?.fetchCalendarFeed
+            ? { fetchCalendarFeed: options.fetchCalendarFeed }
+            : {}),
+          fetchEntityMetadata:
+            fetchEntityMetadata ??
+            (() => Promise.resolve(new Response("", { status: 503 }))),
         }}
       >
         <BackendProviderComponent>
           <AuthProvider>
-            <UserRelayContextProvider>
+            <CalendarFeedProvider>
               <DataProviderComponent>
                 <PaneIndexProvider index={0}>
-                  <VirtuosoMockContext.Provider
+                  <TestListViewportContext.Provider
                     value={{ viewportHeight: 10000, itemHeight: 100 }}
                   >
                     {children}
-                  </VirtuosoMockContext.Provider>
+                  </TestListViewportContext.Provider>
                 </PaneIndexProvider>
               </DataProviderComponent>
-            </UserRelayContextProvider>
+            </CalendarFeedProvider>
           </AuthProvider>
         </BackendProviderComponent>
       </ApiProvider>
@@ -369,9 +511,7 @@ export function renderApis(
     relayPool,
     backend,
     finalizeEvent,
-    nip11,
     eventLoadingTimeout: 0,
-    timeToStorePreLoginEvents: 0,
     ...utils,
   };
 }
@@ -386,30 +526,33 @@ function renderApp(props: RenderApis): RenderViewResult {
 }
 
 export function readonlyRoute(author: string, ...segments: string[]): string {
-  return `/n/${segments.map(encodeURIComponent).join("/")}?author=${author}`;
+  return `/n/${segments.map(encodeURIComponent).join("/")}?source=${author}`;
 }
 
-export async function forkReadonlyRoot(
-  viewer: RenderApis,
-  author: string,
-  ...segments: string[]
-): Promise<void> {
+// The sharing flow as the author performs it: open the document, tap the
+export async function copySecretLinkViaChip(
+  author: RenderApis,
+  rootText: string
+): Promise<string> {
   cleanup();
-  renderApp({
-    ...viewer,
-    initialRoute: readonlyRoute(author, ...segments),
+  window.history.pushState({}, "", "/");
+  const writeText = jest.fn<Promise<void>, [string]>(() => Promise.resolve());
+  // eslint-disable-next-line functional/immutable-data
+  Object.defineProperty(navigator, "clipboard", {
+    value: { writeText },
+    configurable: true,
   });
-  await screen.findByText("READONLY");
-  const copyAction = await screen.findByLabelText(
-    /copy root to edit|Open root to make a copy/
-  );
-  if (copyAction.getAttribute("aria-label") === "copy root to edit") {
-    await userEvent.click(copyAction);
-    return;
+  renderApp({
+    ...author,
+    initialRoute: `/n/${encodeURIComponent(rootText)}`,
+  });
+  await userEvent.click(await screen.findByLabelText("copy secret link"));
+  const url = writeText.mock.calls[0]?.[0];
+  if (typeof url !== "string") {
+    throw new Error(`copySecretLinkViaChip: nothing copied for ${rootText}`);
   }
-  await userEvent.click(copyAction);
-  await screen.findByText("READONLY");
-  await userEvent.click(await screen.findByLabelText("copy root to edit"));
+  cleanup();
+  return url;
 }
 
 export async function openReadonlyRoute(nodeLabel: string): Promise<string> {
@@ -421,31 +564,7 @@ export async function openReadonlyRoute(nodeLabel: string): Promise<string> {
     expect(window.location.pathname).toMatch(/^\/r\//);
   });
 
-  return window.location.pathname;
-}
-
-export async function follow(
-  cU: UpdateState,
-  publicKey: PublicKey
-): Promise<void> {
-  const utils = cU();
-  const plan = planUpsertContact(createPlan(utils), { publicKey });
-  await execute({
-    ...utils,
-    plan,
-  });
-}
-
-export async function unfollow(
-  cU: UpdateState,
-  publicKey: PublicKey
-): Promise<void> {
-  const utils = cU();
-  const plan = planRemoveContact(createPlan(utils), publicKey);
-  await execute({
-    ...utils,
-    plan,
-  });
+  return `${window.location.pathname}${window.location.search}`;
 }
 
 export function renderWithTestData(
@@ -455,6 +574,8 @@ export function renderWithTestData(
     db?: StashmapDB | null;
     BackendProvider?: ProviderComponent;
     DataProvider?: ProviderComponent;
+    storageRelays?: Array<string>;
+    roomRelays?: Array<string>;
   }
 ): TestAppState & RenderResult {
   const props = applyDefaults(options);
@@ -486,11 +607,33 @@ export async function findNewNodeEditor(): Promise<HTMLElement> {
   return screen.findByRole("textbox", { name: "new node editor" });
 }
 
+export function placeCursorAtEnd(element: HTMLElement): void {
+  const range = document.createRange();
+  range.selectNodeContents(element);
+  range.collapse(false);
+  const selection = window.getSelection();
+  selection?.removeAllRanges();
+  selection?.addRange(range);
+}
+
 /**
- * Types text in the new node editor. Shortcut for userEvent.type(await findNewNodeEditor(), text).
+ * Types text in the new node editor with a fresh cursor position.
  */
 export async function type(text: string): Promise<void> {
-  await userEvent.type(await findNewNodeEditor(), text);
+  await userEvent.keyboard("{/Meta}{/Control}{/Shift}{/Alt}");
+  await waitFor(() => {
+    const editor = screen.getByRole("textbox", { name: "new node editor" });
+    editor.focus();
+    const range = document.createRange();
+    range.selectNodeContents(editor);
+    range.collapse(false);
+    const selection = window.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    // eslint-disable-next-line testing-library/no-node-access
+    expect(document.activeElement).toBe(editor);
+  });
+  await userEvent.keyboard(text);
 }
 
 export async function findEvent(
@@ -510,20 +653,7 @@ function RootViewOrPaneIsLoadingInner({
 }: {
   children: React.ReactNode;
 }): JSX.Element {
-  const pane = useCurrentPane();
-  const paneIndex = usePaneIndex();
-  const rootItemID = pane.stack[pane.stack.length - 1] || EMPTY_SEMANTIC_ID;
-
-  return (
-    <LoadSearchData itemIDs={pane.stack}>
-      <RootViewContextProvider
-        root={rootItemID as LongID}
-        paneIndex={paneIndex}
-      >
-        <StorePreLoginContext>{children}</StorePreLoginContext>
-      </RootViewContextProvider>
-    </LoadSearchData>
-  );
+  return <PaneRootViewProvider>{children}</PaneRootViewProvider>;
 }
 
 export function RootViewOrPaneIsLoading({
@@ -581,8 +711,6 @@ function getItemPrefix(innerNode: Element | null, isRef: boolean): string {
   if (isDeleted) return "[D] ";
   const virtualType = innerNode?.getAttribute("data-virtual-type");
   const isOtherUser = innerNode?.getAttribute("data-other-user") === "true";
-  if (virtualType === "suggestion") return "[S] ";
-  if (virtualType === "version") return isOtherUser ? "[VO] " : "[V] ";
   const typeCharMap: Record<string, string> = {
     incoming: "I",
   };
@@ -593,19 +721,68 @@ function getItemPrefix(innerNode: Element | null, isRef: boolean): string {
   return "";
 }
 
+function styledJudgment(row: Element): {
+  relevance: string | undefined;
+  evidence: string | undefined;
+} {
+  /* eslint-disable testing-library/no-node-access */
+  const styled = row.querySelector<HTMLElement>(".node-content-wrapper > span");
+  /* eslint-enable testing-library/no-node-access */
+  if (!styled) {
+    return { relevance: undefined, evidence: undefined };
+  }
+  const { color, textDecoration } = styled.style;
+  const evidence = (() => {
+    if (color === "rgb(133, 153, 0)" || color === "#859900") {
+      return "+";
+    }
+    if (color === "rgb(220, 50, 47)" || color === "#dc322f") {
+      return "-";
+    }
+    return undefined;
+  })();
+  return {
+    relevance: textDecoration.includes("line-through") ? "x" : undefined,
+    evidence,
+  };
+}
+
 function getGutter(row: Element): string | undefined {
   /* eslint-disable testing-library/no-node-access */
-  const selector = row.querySelector(".relevance-selector");
+  const relevanceSelector = row.querySelector(".relevance-selector");
+  const evidenceSelector = row.querySelector(".evidence-selector");
   /* eslint-enable testing-library/no-node-access */
-  const title = selector?.getAttribute("title");
-  if (!title) return undefined;
+  const relevanceTitle = relevanceSelector?.getAttribute("title");
   const gutterMap: Record<string, string> = {
     Relevant: "!",
     "Maybe Relevant": "?",
     "Little Relevant": "~",
     "Not Relevant": "x",
   };
-  return gutterMap[title];
+  const evidenceMap: Record<string, string> = {
+    Confirms: "+",
+    Contradicts: "-",
+  };
+  const relevance = relevanceTitle ? gutterMap[relevanceTitle] : undefined;
+  const evidenceTitle = evidenceSelector?.getAttribute("title");
+  const evidence = evidenceTitle ? evidenceMap[evidenceTitle] : undefined;
+  // Rows without an interactive selector (projections) still show their
+  // relevance in the left indicator gutter — read it as a fallback.
+  const indicatorMap: Record<string, string> = {
+    "relevant-indicator": "!",
+    "maybe-relevant-indicator": "?",
+    "little-relevant-indicator": "~",
+  };
+  const indicator = Object.entries(indicatorMap).find(
+    // eslint-disable-next-line testing-library/no-node-access
+    ([className]) => row.querySelector(`.${className}`) !== null
+  )?.[1];
+  const styled = styledJudgment(row);
+  return (
+    `${relevance ?? indicator ?? styled.relevance ?? ""}${
+      evidence ?? styled.evidence ?? ""
+    }` || undefined
+  );
 }
 
 function classifyRow(row: Element): RowInfo | null {
@@ -658,9 +835,22 @@ function classifyRow(row: Element): RowInfo | null {
     if (!rawText) {
       return null;
     }
+    // The aria label carries the plain display text; the reciprocal ↩
+    // cluster lives in the row content and must survive an expand toggle.
+    // Reference rows already speak ↩ through their own text.
+    /* eslint-disable testing-library/no-node-access */
+    const reciprocalCluster = Array.from(
+      innerNode?.querySelectorAll(
+        ".incoming-part:not(.external-link-part):not(.dead-link-part)"
+      ) ?? []
+    )
+      .filter((part) => part.closest('[data-testid="reference-row"]') === null)
+      .map((part) => part.textContent ?? "")
+      .join("");
+    /* eslint-enable testing-library/no-node-access */
     return withGutter({
       element: toggleButton as HTMLElement,
-      text: `${prefix}${rawText}`,
+      text: `${prefix}${rawText}${reciprocalCluster}`,
       indentLevel: getIndentLevel(toggleButton as HTMLElement),
     });
   }
@@ -727,6 +917,7 @@ function classifyRow(row: Element): RowInfo | null {
 
 type TreeOptions = {
   showGutter?: boolean;
+  composedOnly?: boolean;
 };
 
 async function getTreeStructure(options?: TreeOptions): Promise<string> {
@@ -735,17 +926,23 @@ async function getTreeStructure(options?: TreeOptions): Promise<string> {
   });
 
   /* eslint-disable testing-library/no-node-access */
-  const allRows = document.querySelectorAll(".item");
+  const allRows = Array.from(document.querySelectorAll(".item")).filter(
+    (row) =>
+      !(options?.composedOnly && row.querySelector(".incoming-indicator"))
+  );
   /* eslint-enable testing-library/no-node-access */
 
-  const rowInfos: RowInfo[] = Array.from(allRows)
+  const rowInfos: RowInfo[] = allRows
     .map((row) => classifyRow(row))
     .filter((info): info is RowInfo => info !== null);
 
   const lines = rowInfos.map(({ text, indentLevel, gutter }) => {
     const indent = "  ".repeat(indentLevel);
     const gutterPrefix = options?.showGutter && gutter ? `{${gutter}} ` : "";
-    return `${indent}${gutterPrefix}${text}`;
+    const visibleText = options?.composedOnly
+      ? text.replace(/[†↻↗]+$/u, "")
+      : text;
+    return `${indent}${gutterPrefix}${visibleText}`;
   });
 
   return lines.join("\n");
@@ -767,10 +964,13 @@ export async function expectTree(
     .join("\n");
 
   try {
-    await waitFor(async () => {
-      const actual = await getTreeStructure(options);
-      expect(actual).toEqual(expectedNormalized);
-    });
+    await waitFor(
+      async () => {
+        const actual = await getTreeStructure(options);
+        expect(actual).toEqual(expectedNormalized);
+      },
+      { timeout: 10000 }
+    );
   } catch (error) {
     const actual = await getTreeStructure(options);
     // eslint-disable-next-line no-console
@@ -815,10 +1015,35 @@ export function getPane(paneIndex: number): ReturnType<typeof within> {
   return within(el);
 }
 
+function isPaneFocusedOnNode(
+  paneScope: ReturnType<typeof within>,
+  nodeName: string
+): boolean {
+  // eslint-disable-next-line testing-library/prefer-screen-queries
+  const rows = paneScope.queryAllByRole("treeitem");
+  const firstRow = rows[0];
+  return firstRow?.getAttribute("data-node-text") === nodeName;
+}
+
 export async function navigateToNodeViaSearch(
   paneIndex: number,
-  nodeName: string
+  nodeName: string,
+  options: { waitForFullscreen?: boolean } = {}
 ): Promise<void> {
+  // eslint-disable-next-line testing-library/no-node-access
+  const existingPaneContainer = document.querySelector(
+    `[data-pane-index="${paneIndex}"]`
+  ) as HTMLElement;
+  const existingPaneScope = existingPaneContainer
+    ? within(existingPaneContainer)
+    : screen;
+  const isOnConcreteRoute = /^\/(local|storage|deposit)\//u.test(
+    window.location.pathname
+  );
+  if (isOnConcreteRoute && isPaneFocusedOnNode(existingPaneScope, nodeName)) {
+    return;
+  }
+
   await userEvent.click(
     await screen.findByLabelText(`Search to change pane ${paneIndex} content`)
   );
@@ -846,55 +1071,84 @@ export async function navigateToNodeViaSearch(
   const exactNavigateButton =
     navigateButtons.find(
       (button) =>
+        button.getAttribute("aria-label") === `Navigate to ${nodeName}` &&
+        button.getAttribute("href")?.includes("/local/n/")
+    ) ||
+    navigateButtons.find(
+      (button) =>
         button.getAttribute("aria-label") === `Navigate to ${nodeName}`
-    ) || navigateButtons[0];
+    ) ||
+    navigateButtons[0];
   await userEvent.click(exactNavigateButton);
 
   // Navigation can finish before descendants are rendered; wait for the target
-  // row/editor without relying on expand/collapse controls.
+  // row/editor in the requested pane without relying on expand/collapse controls.
   await waitFor(() => {
-    const hasEditor = screen.queryAllByLabelText(`edit ${nodeName}`).length > 0;
+    const hasEditor =
+      // eslint-disable-next-line testing-library/prefer-screen-queries
+      paneScope.queryAllByLabelText(`edit ${nodeName}`).length > 0;
     const hasTreeRow =
-      screen.queryAllByRole("treeitem", { name: nodeName }).length > 0;
+      // eslint-disable-next-line testing-library/prefer-screen-queries
+      paneScope.queryAllByRole("treeitem", { name: nodeName }).length > 0;
     expect(hasEditor || hasTreeRow).toBe(true);
   });
 
-  // Search results are crefs, so navigation lands on the parent context.
-  // Click the fullscreen button to make the target node the pane root.
-  const fullscreenButtons = screen.queryAllByLabelText(
+  // Search result navigation may land on the parent context, so make the
+  // target node the pane root when that pane renders a matching control.
+  // eslint-disable-next-line testing-library/prefer-screen-queries
+  const fullscreenButtons = paneScope.queryAllByLabelText(
     `open ${nodeName} in fullscreen`
   );
   if (fullscreenButtons.length > 0) {
-    await userEvent.click(fullscreenButtons[fullscreenButtons.length - 1]);
+    const fullscreenButton = fullscreenButtons[fullscreenButtons.length - 1];
+    const fullscreenHref = fullscreenButton.getAttribute("href");
+    await userEvent.click(fullscreenButton);
     await waitFor(() => {
-      const hasEditor =
-        screen.queryAllByLabelText(`edit ${nodeName}`).length > 0;
-      const hasTreeRow =
-        screen.queryAllByRole("treeitem", { name: nodeName }).length > 0;
-      expect(hasEditor || hasTreeRow).toBe(true);
+      if (fullscreenHref) {
+        expect(
+          `${window.location.pathname}${window.location.search}${window.location.hash}`
+        ).toBe(fullscreenHref);
+        return;
+      }
+      expect(isPaneFocusedOnNode(paneScope, nodeName)).toBe(true);
+    });
+  }
+
+  if (options.waitForFullscreen) {
+    await waitFor(() => {
+      expect(window.location.pathname).toMatch(/^\/(local|storage|deposit)\//u);
     });
   }
 }
 
-function getDropDepthLimits(
-  sourceName: string,
-  targetName: string
+export async function openNodeInFullscreen(
+  paneIndex: number,
+  nodeName: string
+): Promise<void> {
+  // eslint-disable-next-line testing-library/no-node-access
+  const paneContainer = document.querySelector(
+    `[data-pane-index="${paneIndex}"]`
+  ) as HTMLElement;
+  const paneScope = paneContainer ? within(paneContainer) : screen;
+  // eslint-disable-next-line testing-library/prefer-screen-queries
+  const fullscreenButtons = paneScope.queryAllByLabelText(
+    `open ${nodeName} in fullscreen`
+  );
+  if (fullscreenButtons.length > 0) {
+    await userEvent.click(fullscreenButtons[fullscreenButtons.length - 1]);
+  }
+  await waitFor(() => {
+    expect(isPaneFocusedOnNode(paneScope, nodeName)).toBe(true);
+  });
+}
+
+function getDropDepthLimitsForRows(
+  sourceRow: Element,
+  targetRow: Element
 ): { minDepth: number; maxDepth: number } {
   /* eslint-disable testing-library/no-node-access */
   const allRows = Array.from(document.querySelectorAll(".item"));
   /* eslint-enable testing-library/no-node-access */
-
-  const sourceRow = allRows.find(
-    (r) => r.getAttribute("data-node-text") === sourceName
-  );
-  const targetRow = allRows.find(
-    (r) => r.getAttribute("data-node-text") === targetName
-  );
-  if (!sourceRow || !targetRow) {
-    throw new Error(
-      `Could not find source "${sourceName}" or target "${targetName}" in tree`
-    );
-  }
 
   const targetIndex = allRows.indexOf(targetRow);
   const nextRow = allRows[targetIndex + 1];
@@ -921,6 +1175,29 @@ function getDropDepthLimits(
   );
 }
 
+function getDropDepthLimits(
+  sourceName: string,
+  targetName: string
+): { minDepth: number; maxDepth: number } {
+  /* eslint-disable testing-library/no-node-access */
+  const allRows = Array.from(document.querySelectorAll(".item"));
+  /* eslint-enable testing-library/no-node-access */
+
+  const sourceRow = allRows.find(
+    (r) => r.getAttribute("data-node-text") === sourceName
+  );
+  const targetRow = allRows.find(
+    (r) => r.getAttribute("data-node-text") === targetName
+  );
+  if (!sourceRow || !targetRow) {
+    throw new Error(
+      `Could not find source "${sourceName}" or target "${targetName}" in tree`
+    );
+  }
+
+  return getDropDepthLimitsForRows(sourceRow, targetRow);
+}
+
 export function setDropIndentLevel(
   sourceName: string,
   targetName: string,
@@ -928,6 +1205,26 @@ export function setDropIndentLevel(
 ): void {
   const { minDepth, maxDepth } = getDropDepthLimits(sourceName, targetName);
   if (depth < minDepth || depth > maxDepth) {
+    throw new Error(
+      `Depth ${depth} is outside allowed range [${minDepth}, ${maxDepth}] ` +
+        `when dragging "${sourceName}" onto "${targetName}"`
+    );
+  }
+  setDropIndentDepth(depth);
+}
+
+export function setDropIndentLevelForRows(
+  sourceRow: Element,
+  targetRow: Element,
+  depth: number
+): void {
+  const { minDepth, maxDepth } = getDropDepthLimitsForRows(
+    sourceRow,
+    targetRow
+  );
+  if (depth < minDepth || depth > maxDepth) {
+    const sourceName = sourceRow.getAttribute("data-node-text") ?? "";
+    const targetName = targetRow.getAttribute("data-node-text") ?? "";
     throw new Error(
       `Depth ${depth} is outside allowed range [${minDepth}, ${maxDepth}] ` +
         `when dragging "${sourceName}" onto "${targetName}"`

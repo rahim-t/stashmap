@@ -1,15 +1,14 @@
 // eslint-disable-next-line import/no-extraneous-dependencies
 import { contextBridge, ipcRenderer, IpcRendererEvent } from "electron";
 import type { IpcChannel } from "../infra/filesystem/electronWorkspaceIpc";
-import type { FsEvent } from "../core/workspaceWatcher";
+import type { FsEvent } from "../infra/filesystem/workspaceWatcher";
 
 const workspace: IpcChannel = {
   load: () => ipcRenderer.invoke("workspace:load"),
   pickFolder: () => ipcRenderer.invoke("workspace:pickFolder"),
   open: (folder) => ipcRenderer.invoke("workspace:open", folder),
   create: (args) => ipcRenderer.invoke("workspace:create", args),
-  isInitialised: (folder) =>
-    ipcRenderer.invoke("workspace:isInitialised", folder),
+  configure: (config) => ipcRenderer.invoke("workspace:configure", config),
   save: (documents, deletedPaths) =>
     ipcRenderer.invoke("workspace:save", documents, deletedPaths),
   onFsEvent: (listener) => {
@@ -26,4 +25,11 @@ contextBridge.exposeInMainWorld("knowstrDesktop", {
   isElectron: true,
   platform: process.platform,
   workspace,
+  fetchText: async (url: string): Promise<string> => {
+    const text: unknown = await ipcRenderer.invoke("net:fetch-text", url);
+    if (typeof text !== "string") {
+      throw new Error("net:fetch-text returned a non-string");
+    }
+    return text;
+  },
 });
